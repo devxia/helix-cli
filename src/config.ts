@@ -1,0 +1,292 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
+import { z } from "zod";
+
+// ---------------------------------------------------------------------------
+// Schemas
+// ---------------------------------------------------------------------------
+
+const providerSchema = z.object({
+  name: z.string(),
+  base_url: z.string(),
+  api_key: z.string().default(""),
+});
+
+const configSchema = z.object({
+  active_provider: z.string().default("kimi"),
+  active_model: z.string().default("kimi-k2"),
+  thinking: z.boolean().default(true),
+  providers: z.record(providerSchema),
+});
+
+export type ProviderConfig = z.infer<typeof providerSchema>;
+export type Config = z.infer<typeof configSchema>;
+
+// ---------------------------------------------------------------------------
+// Available models — persisted to disk, auto-refreshed from API
+// ---------------------------------------------------------------------------
+
+export interface ModelDef {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+/** Hardcoded fallback when neither disk cache nor API is available. */
+const FALLBACK_MODELS: Record<string, ModelDef[]> = {
+  kimi: [
+    { id: "kimi-k2", label: "Kimi K2", description: "Latest, thinking-aware" },
+    { id: "moonshot-v1-8k", label: "Moonshot v1 8K" },
+    { id: "moonshot-v1-32k", label: "Moonshot v1 32K" },
+    { id: "moonshot-v1-128k", label: "Moonshot v1 128K" },
+  ],
+  deepseek: [
+    { id: "deepseek-chat", label: "DeepSeek Chat", description: "General purpose" },
+    { id: "deepseek-reasoner", label: "DeepSeek Reasoner", description: "Reasoning-focused" },
+  ],
+};
+
+// ---------------------------------------------------------------------------
+// Disk cache for models — persisted across sessions
+// ---------------------------------------------------------------------------
+
+function modelsCachePath(): string {
+  return path.join(configDir(), "models_cache.toml");
+}
+
+function loadModelsFromDisk(): Map<string, ModelDef[]> {
+  const cache = new Map<string, ModelDef[]>();
+  const file = modelsCachePath();
+  if (!fs.existsSync(file)) return cache;
+  try {
+    const raw = fs.readFileSync(file, "utf-8");
+    const parsed = Bun.TOML.parse(raw) as Record<string, unknown>;
+    for (const [id, entry] of Object.entries(parsed)) {
+      const arr = (entry as Record<string, unknown> | undefined)?.models;
+      if (!Array.isArray(arr)) continue;
+      cache.set(id, arr.map((m: Record<string, unknown>) => ({
+        id: String(m.id ?? ""),
+        label: String(m.label ?? m.id ?? ""),
+        description: m.description ? String(m.description) : undefined,
+      })));
+    }
+  } catch { /* corrupt → ignore */ }
+  return cache;
+}
+
+function saveModelsToDisk(cache: Map<string, ModelDef[]>): void {
+  ensureConfigDir();
+  const sections: string[] = [];
+  for (const [id, models] of cache) {
+    sections.push(`\n[${id}]\nmodels = [`);
+    for (const m of models) {
+      const desc = m.description ? `, description = "${m.description.replace(/"/g, '\\"')}"` : "";
+      sections.push(`  { id = "${m.id}", label = "${m.label}"${desc} },`);
+    }
+    sections.push("]");
+  }
+  fs.writeFileSync(modelsCachePath(), sections.join("\n"), "utf-8");
+}
+
+/** In-memory cache, lazily loaded from disk on first access. */
+let _modelCache: Map<string, ModelDef[]> | null = null;
+
+function modelCache(): Map<string, ModelDef[]> {
+  if (!_modelCache) {
+    _modelCache = loadModelsFromDisk();
+  }
+  return _modelCache;
+}
+
+// ---------------------------------------------------------------------------
+// Default providers
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
+  kimi: {
+    name: "Kimi Code",
+    base_url: "https://api.moonshot.cn/v1",
+    api_key: "",
+  },
+  deepseek: {
+    name: "Deepseek",
+    base_url: "https://api.deepseek.com",
+    api_key: "",
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+function configDir(): string {
+  return path.join(os.homedir(), ".helix");
+}
+
+function configPath(): string {
+  return path.join(configDir(), "config.toml");
+}
+
+// ---------------------------------------------------------------------------
+// TOML helpers
+// ---------------------------------------------------------------------------
+
+function stringifyConfig(cfg: Config): string {
+  const lines: string[] = [];
+  lines.push(`active_provider = "${cfg.active_provider}"`);
+  lines.push(`active_model = "${cfg.active_model}"`);
+  lines.push(`thinking = ${cfg.thinking}`);
+  lines.push("");
+  for (const [id, p] of Object.entries(cfg.providers)) {
+    lines.push(`[providers.${id}]`);
+    lines.push(`name = "${p.name}"`);
+    lines.push(`base_url = "${p.base_url}"`);
+    lines.push(`api_key = "${p.api_key}"`);
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Load / Save
+// ---------------------------------------------------------------------------
+
+function ensureConfigDir(): void {
+  const dir = configDir();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function defaultConfig(): Config {
+  return {
+    active_provider: "kimi",
+    active_model: "kimi-k2",
+    thinking: true,
+    providers: { ...DEFAULT_PROVIDERS },
+  };
+}
+
+export function loadConfig(): Config {
+  const file = configPath();
+  if (!fs.existsSync(file)) {
+    return defaultConfig();
+  }
+  try {
+    const raw = fs.readFileSync(file, "utf-8");
+    const parsed = Bun.TOML.parse(raw);
+    return configSchema.parse(parsed);
+  } catch {
+    return defaultConfig();
+  }
+}
+
+export function saveConfig(cfg: Config): void {
+  ensureConfigDir();
+  const validated = configSchema.parse(cfg);
+  fs.writeFileSync(configPath(), stringifyConfig(validated), "utf-8");
+}
+
+// ---------------------------------------------------------------------------
+// Provider helpers
+// ---------------------------------------------------------------------------
+
+export function getActiveProvider(): ProviderConfig {
+  const cfg = loadConfig();
+  const activeId = cfg.active_provider;
+  return cfg.providers[activeId] ?? DEFAULT_PROVIDERS.kimi!;
+}
+
+export function setProvider(providerId: string, apiKey: string): Config {
+  const cfg = loadConfig();
+  const provider = cfg.providers[providerId];
+  if (!provider) {
+    throw new Error(`Unknown provider: ${providerId}`);
+  }
+  provider.api_key = apiKey;
+  cfg.active_provider = providerId;
+  // Reset model to the provider's first available model when switching
+  const models = getAvailableModels(providerId);
+  cfg.active_model = models[0]?.id ?? providerId;
+  saveConfig(cfg);
+  return cfg;
+}
+
+export function listProviders(): Array<{ id: string } & ProviderConfig> {
+  const cfg = loadConfig();
+  return Object.entries(cfg.providers).map(([id, p]) => ({ id, ...p }));
+}
+
+// ---------------------------------------------------------------------------
+// Model helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the model list from a provider's /v1/models endpoint.
+ * Persists to disk cache so the list survives restarts.
+ */
+export async function refreshProviderModels(providerId: string): Promise<ModelDef[]> {
+  const config = loadConfig();
+  const provider = config.providers[providerId];
+  if (!provider) return FALLBACK_MODELS[providerId] ?? [];
+
+  const apiKey = provider.api_key || process.env.KIMI_API_KEY;
+  const baseUrl = process.env.KIMI_BASE_URL || provider.base_url;
+  try {
+    const res = await fetch(`${baseUrl}/models`, {
+      headers: apiKey
+        ? { Authorization: `Bearer ${apiKey}`, "User-Agent": "HelixCLI/1.0" }
+        : { "User-Agent": "HelixCLI/1.0" },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const body = (await res.json()) as { data?: Array<{ id: string }> };
+    if (!Array.isArray(body.data)) throw new Error("Unexpected response shape");
+
+    const models: ModelDef[] = body.data
+      .filter((m) => m.id && typeof m.id === "string")
+      .map((m) => ({ id: m.id, label: m.id }));
+
+    if (models.length === 0) throw new Error("Empty model list");
+
+    modelCache().set(providerId, models);
+    saveModelsToDisk(modelCache());
+    return models;
+  } catch {
+    // API unreachable → keep existing disk cache or use hardcoded
+    const fallback = modelCache().get(providerId) ?? FALLBACK_MODELS[providerId] ?? [];
+    modelCache().set(providerId, fallback);
+    return fallback;
+  }
+}
+
+export function getAvailableModels(providerId: string): ModelDef[] {
+  return modelCache().get(providerId) ?? FALLBACK_MODELS[providerId] ?? [];
+}
+
+export function getActiveModel(): string {
+  return loadConfig().active_model;
+}
+
+export function setActiveModel(modelId: string): void {
+  const cfg = loadConfig();
+  cfg.active_model = modelId;
+  saveConfig(cfg);
+}
+
+// ---------------------------------------------------------------------------
+// Thinking helpers
+// ---------------------------------------------------------------------------
+
+export function isThinkingEnabled(): boolean {
+  return loadConfig().thinking;
+}
+
+export function setThinkingEnabled(enabled: boolean): void {
+  const cfg = loadConfig();
+  cfg.thinking = enabled;
+  saveConfig(cfg);
+}
