@@ -1,0 +1,14 @@
+{
+  "name": "helix",
+  "version": "0.0.2",
+  "module": "index.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot src/main.ts",
+    "build": "bun build --compile --outfile helix src/main.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "^0.79.0",
+    "openai": "^4.70.0"
+  }
+}

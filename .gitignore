@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+
+# Build artifacts
+helix
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+bun-debug.log*
+
+# Temp/cache
+.tmp/
+temp/
+.cache/
