@@ -7,8 +7,13 @@ import {
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
+  CombinedAutocompleteProvider,
 } from "@earendil-works/pi-tui";
 import OpenAI from "openai";
+import { getActiveProvider, getActiveModel, isThinkingEnabled, refreshProviderModels, loadConfig } from "../../config.js";
+import { type CommandContext, registry } from "../../commands/index.js";
+import { executeProviderCommand } from "../../commands/provider.js";
+import { executeModelCommand } from "../../commands/model.js";
 
 type ChatMessage = {
   role: "user" | "assistant" | "system";
@@ -44,8 +49,8 @@ export class ChatScreen implements Component, Focusable {
   focused = false;
 
   private readonly editor: Editor;
-  private readonly client: OpenAI;
-  private readonly model: string;
+  private client: OpenAI;
+  private model: string;
   private readonly conversation: Array<{ role: "user" | "assistant"; content: string }> = [];
   private readonly messages: ChatMessage[] = [
     {
@@ -56,20 +61,101 @@ export class ChatScreen implements Component, Focusable {
   private activeRequest: AbortController | null = null;
   private exitOnNextInterrupt = false;
   private status = "Idle";
+  /** When set, the editor is replaced by a command UI component. */
+  private commandComponent: Component | null = null;
 
   constructor(private readonly tui: TUI) {
-    this.client = new OpenAI({
-      apiKey: process.env.KIMI_API_KEY,
-      baseURL: process.env.KIMI_BASE_URL || "https://api.moonshot.cn/v1",
-      defaultHeaders: {
-        "User-Agent": "KimiCLI/1.5",
-      },
-    });
-    this.model = process.env.KIMI_MODEL || "kimi-k2";
+    this.client = this.createClient();
+    this.model = this.resolveModel();
 
     this.editor = new Editor(tui, editorTheme, { paddingX: 1 });
     this.editor.onSubmit = (text) => {
       void this.handleSubmit(text);
+    };
+
+    // -- Register slash commands -------------------------------------------
+    registry.register({
+      name: "provider",
+      description: "Select an LLM provider and enter API key",
+      execute: (ctx) => executeProviderCommand(ctx),
+    });
+    registry.register({
+      name: "model",
+      description: "Select model and toggle thinking mode",
+      execute: (ctx) => executeModelCommand(ctx),
+    });
+
+    // Fetch fresh model list from provider API in the background
+    const providerId = loadConfig().active_provider;
+    refreshProviderModels(providerId);
+
+    // Wire up slash-command autocomplete
+    const slashCommands = registry.list().map((cmd) => ({
+      name: cmd.name,
+      description: cmd.description,
+    }));
+    this.editor.setAutocompleteProvider(
+      new CombinedAutocompleteProvider(slashCommands, process.cwd()),
+    );
+  }
+
+  // -- Provider helpers ----------------------------------------------------
+
+  private thinkingEnabled(): boolean {
+    return isThinkingEnabled();
+  }
+
+  private createClient(): OpenAI {
+    const provider = this.resolveProvider();
+    return new OpenAI({
+      apiKey: provider.api_key || undefined,
+      baseURL: provider.base_url,
+      defaultHeaders: { "User-Agent": "KimiCLI/1.5" },
+    });
+  }
+
+  private resolveModel(): string {
+    return process.env.KIMI_MODEL || getActiveModel();
+  }
+
+  private resolveProvider() {
+    const envKey = process.env.KIMI_API_KEY;
+    const envUrl = process.env.KIMI_BASE_URL;
+    // If env vars are set, they take precedence for backward compatibility.
+    if (envKey) {
+      const provider = getActiveProvider();
+      return {
+        name: provider.name,
+        base_url: envUrl || provider.base_url,
+        api_key: envKey,
+      };
+    }
+    return getActiveProvider();
+  }
+
+  // -- CommandContext implementation ---------------------------------------
+
+  private getCommandContext(): CommandContext {
+    return {
+      showComponent: (component) => {
+        this.commandComponent = component;
+        this.tui.setFocus(this);
+        this.tui.requestRender(true);
+      },
+      done: () => {
+        this.commandComponent = null;
+        this.tui.requestRender(true);
+      },
+      addSystemMessage: (text) => {
+        this.messages.push({ role: "system", content: text });
+      },
+      applyProvider: () => {
+        this.client = this.createClient();
+        this.model = this.resolveModel();
+        // Refresh model list for the new provider
+        const providerId = loadConfig().active_provider;
+        refreshProviderModels(providerId);
+      },
     };
   }
 
@@ -94,6 +180,12 @@ export class ChatScreen implements Component, Focusable {
   }
 
   handleInput(data: string): void {
+    if (this.commandComponent?.handleInput) {
+      this.commandComponent.handleInput(data);
+      this.tui.requestRender();
+      return;
+    }
+
     this.exitOnNextInterrupt = false;
     if (!this.activeRequest && this.status === "Press Ctrl+C again to exit.") {
       this.status = "Idle";
@@ -103,14 +195,25 @@ export class ChatScreen implements Component, Focusable {
 
   invalidate(): void {
     this.editor.invalidate();
+    this.commandComponent?.invalidate();
   }
 
   render(width: number): string[] {
     const safeWidth = Math.max(24, width);
     const height = Math.max(10, this.tui.terminal.rows);
     const innerWidth = safeWidth - 2;
-    const editorLines = this.editor.render(innerWidth).slice(0, Math.max(3, Math.floor(height * 0.3)));
-    const fixedRows = 5 + editorLines.length;
+
+    // Command mode: swap editor for command UI
+    let inputLines: string[];
+    let inputLabel = " Input ";
+    if (this.commandComponent) {
+      inputLines = this.commandComponent.render(innerWidth);
+      inputLabel = " Command ";
+    } else {
+      inputLines = this.editor.render(innerWidth).slice(0, Math.max(3, Math.floor(height * 0.3)));
+    }
+
+    const fixedRows = 5 + inputLines.length;
     const messageRows = Math.max(1, height - fixedRows);
     const messageLines = this.renderMessages(innerWidth, messageRows);
     const lines: string[] = [];
@@ -123,11 +226,18 @@ export class ChatScreen implements Component, Focusable {
       lines.push(this.frameLine(line, innerWidth));
     }
 
-    lines.push(this.separator(safeWidth, " Input "));
+    lines.push(this.separator(safeWidth, inputLabel));
 
-    for (const line of editorLines) {
+    for (const line of inputLines) {
       lines.push(this.frameLine(line, innerWidth));
     }
+
+    // Model info line
+    const model = this.model;
+    const thinking = this.thinkingEnabled();
+    const thinkingIcon = thinking ? "💭" : "  ";
+    const info = `${DIM}${model} · ${thinkingIcon}${RESET}`;
+    lines.push(this.frameLine(info, innerWidth));
 
     lines.push(this.bottomBorder(safeWidth, this.status));
 
@@ -136,7 +246,16 @@ export class ChatScreen implements Component, Focusable {
 
   private async handleSubmit(text: string): Promise<void> {
     const input = text.trim();
-    if (!input || this.activeRequest) {
+    if (!input || this.activeRequest || this.commandComponent) {
+      return;
+    }
+
+    // Slash command routing
+    const cmd = registry.parse(input);
+    if (cmd) {
+      this.messages.push({ role: "user", content: input });
+      cmd.execute(this.getCommandContext());
+      this.tui.requestRender(true);
       return;
     }
 
@@ -230,10 +349,11 @@ export class ChatScreen implements Component, Focusable {
   private renderMessages(width: number, maxRows: number): string[] {
     const rendered: string[] = [];
     const reasonPrefix = `${DIM}${YELLOW}> ${RESET}${DIM}`;
+    const showReasoning = this.thinkingEnabled();
 
     for (const message of this.messages) {
-      // Render reasoning first (dimmed yellow)
-      if (message.role === "assistant" && message.reasoning) {
+      // Render reasoning first (dimmed yellow) — only when thinking is enabled
+      if (showReasoning && message.role === "assistant" && message.reasoning) {
         const wrapped = wrapTextWithAnsi(
           `${reasonPrefix}${message.reasoning}`,
           Math.max(1, width - 2),
