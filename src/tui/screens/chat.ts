@@ -13,13 +13,21 @@ import OpenAI from "openai";
 type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
+  reasoning?: string;
 };
+
+/** Kimi API extends the standard delta with a reasoning_content field. */
+interface DeltaWithReasoning {
+  content?: string | null;
+  reasoning_content?: string;
+}
 
 const RESET = "\x1b[0m";
 const DIM = "\x1b[2m";
 const CYAN = "\x1b[36m";
 const GREEN = "\x1b[32m";
 const RED = "\x1b[31m";
+const YELLOW = "\x1b[33m";
 
 const editorTheme: EditorTheme = {
   borderColor: (text) => `${CYAN}${text}${RESET}`,
@@ -157,15 +165,34 @@ export class ChatScreen implements Component, Focusable {
       );
 
       let reply = "";
+      let reasoning = "";
+      let state: "thinking" | "answering" = "thinking";
+
       for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta?.content || "";
+        const delta = chunk.choices[0]?.delta as DeltaWithReasoning | undefined;
         if (!delta) {
           continue;
         }
 
-        reply += delta;
-        this.updateLastAssistantMessage(reply);
-        this.tui.requestRender();
+        const contentDelta = delta.content || "";
+        const reasoningDelta = delta.reasoning_content || "";
+
+        if (reasoningDelta) {
+          reasoning += reasoningDelta;
+          this.status = "Thinking...";
+        }
+        if (contentDelta) {
+          if (state === "thinking") {
+            state = "answering";
+          }
+          reply += contentDelta;
+          this.status = "Streaming...";
+        }
+
+        if (contentDelta || reasoningDelta) {
+          this.updateLastAssistantMessage(reply, reasoning);
+          this.tui.requestRender();
+        }
       }
 
       if (!controller.signal.aborted) {
@@ -183,24 +210,41 @@ export class ChatScreen implements Component, Focusable {
       }
     } finally {
       this.activeRequest = null;
-      if (this.status === "Streaming...") {
+      if (this.status === "Streaming..." || this.status === "Thinking...") {
         this.status = "Idle";
       }
       this.tui.requestRender(true);
     }
   }
 
-  private updateLastAssistantMessage(content: string): void {
+  private updateLastAssistantMessage(content: string, reasoning?: string): void {
     const last = this.messages[this.messages.length - 1];
     if (last?.role === "assistant") {
       last.content = content;
+      if (reasoning) {
+        last.reasoning = reasoning;
+      }
     }
   }
 
   private renderMessages(width: number, maxRows: number): string[] {
     const rendered: string[] = [];
+    const reasonPrefix = `${DIM}${YELLOW}> ${RESET}${DIM}`;
 
     for (const message of this.messages) {
+      // Render reasoning first (dimmed yellow)
+      if (message.role === "assistant" && message.reasoning) {
+        const wrapped = wrapTextWithAnsi(
+          `${reasonPrefix}${message.reasoning}`,
+          Math.max(1, width - 2),
+        );
+        for (const line of wrapped) {
+          rendered.push(` ${line}`);
+        }
+        // Empty separator line between reasoning and answer
+        rendered.push("");
+      }
+
       const prefix = this.messagePrefix(message.role);
       const wrapped = wrapTextWithAnsi(`${prefix}${message.content || " "}`, Math.max(1, width - 2));
       for (const line of wrapped) {
