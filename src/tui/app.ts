@@ -1,4 +1,4 @@
-import { matchesKey, ProcessTerminal, TUI } from "@earendil-works/pi-tui";
+import { isKeyRelease, matchesKey, ProcessTerminal, TUI } from "@earendil-works/pi-tui";
 import { ChatScreen } from "./screens/chat.js";
 
 export class HelixApp {
@@ -18,6 +18,12 @@ export class HelixApp {
     this.tui.addInputListener((data) => {
       if (!matchesKey(data, "ctrl+c")) {
         return;
+      }
+
+      // Filter out key release events — Kitty keyboard protocol reports both
+      // press and release, but we only want to act on the press.
+      if (isKeyRelease(data)) {
+        return { consume: true };
       }
 
       if (this.chat.handleInterrupt()) {
