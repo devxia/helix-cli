@@ -10,10 +10,22 @@ import {
   CombinedAutocompleteProvider,
 } from "@earendil-works/pi-tui";
 import OpenAI from "openai";
-import { getActiveProvider, getActiveModel, isThinkingEnabled, refreshProviderModels, loadConfig } from "../../config.js";
+import {
+  getActiveProvider,
+  getActiveModel,
+  getAvailableModels,
+  hasApiKey,
+  isThinkingEnabled,
+  refreshProviderModels,
+  loadConfig,
+  resolveApiKey,
+  resolveBaseUrl,
+} from "../../config.js";
 import { type CommandContext, registry } from "../../commands/index.js";
 import { executeProviderCommand } from "../../commands/provider.js";
 import { executeModelCommand } from "../../commands/model.js";
+import { preloadCatalogModels } from "../../catalog.js";
+import { setProviderModels } from "../../config.js";
 
 type ChatMessage = {
   role: "user" | "assistant" | "system";
@@ -68,6 +80,19 @@ export class ChatScreen implements Component, Focusable {
     this.client = this.createClient();
     this.model = this.resolveModel();
 
+    // If no provider has a key, show setup guidance
+    const anyKeyConfigured = Object.entries(loadConfig().providers).some(
+      ([id, p]) => hasApiKey(id, p),
+    );
+    if (!anyKeyConfigured) {
+      this.messages = [
+        { role: "system", content: `${CYAN}Welcome to Helix CLI!${RESET}` },
+        { role: "system", content: `No API key configured yet.` },
+        { role: "system", content: `Type ${GREEN}/provider${RESET} to set up an LLM provider and start chatting.` },
+      ];
+      this.status = "No API key — type /provider to get started";
+    }
+
     this.editor = new Editor(tui, editorTheme, { paddingX: 1 });
     this.editor.onSubmit = (text) => {
       void this.handleSubmit(text);
@@ -89,6 +114,13 @@ export class ChatScreen implements Component, Focusable {
     const providerId = loadConfig().active_provider;
     refreshProviderModels(providerId);
 
+    // Pre-populate models from catalog cache (fast, no network needed)
+    preloadCatalogModels().then((catalogModels) => {
+      for (const [pid, models] of catalogModels) {
+        setProviderModels(pid, models);
+      }
+    });
+
     // Wire up slash-command autocomplete
     const slashCommands = registry.list().map((cmd) => ({
       name: cmd.name,
@@ -105,32 +137,90 @@ export class ChatScreen implements Component, Focusable {
     return isThinkingEnabled();
   }
 
+  /** Whether the *currently active model* advertises reasoning support. */
+  private currentModelSupportsThinking(): boolean {
+    const providerId = loadConfig().active_provider;
+    const models = getAvailableModels(providerId);
+    const current = models.find((m) => m.id === this.model);
+    return current?.reasoning === true;
+  }
+
+  private providerIcon(providerId: string): string {
+    const iconMap: Record<string, string> = {
+      kimi: "🌙",
+      "kimi-code": "💻",
+      "moonshot-cn": "🌙",
+      "moonshot-ai": "🌙",
+      openai: "⚡",
+      anthropic: "◈",
+      "google-genai": "🔷",
+      vertexai: "🔷",
+      deepseek: "🔮",
+      qwen: "🧩",
+      siliconflow: "🌊",
+      volcengine: "🌋",
+      zhipu: "🔮",
+      minimax: "🎯",
+      yi: "✨",
+      baichuan: "🏔️",
+      mistral: "🌀",
+      groq: "⚡",
+      xai: "✖",
+      togetherai: "🤝",
+      fireworks: "🎆",
+      openrouter: "🔀",
+      perplexity: "🔍",
+      cohere: "🔷",
+      deepinfra: "🏗️",
+      cerebras: "🧠",
+    };
+    return iconMap[providerId] ?? "⚡";
+  }
+
   private createClient(): OpenAI {
-    const provider = this.resolveProvider();
+    const provider = getActiveProvider();
+    const providerId = loadConfig().active_provider;
+    const apiKey = resolveApiKey(providerId, provider);
+    const baseURL = resolveBaseUrl(providerId, provider);
+
+    // TODO: anthropic and google-genai types need their own SDKs.
+    // For now we use the OpenAI SDK for all types (it works for openai-compatible).
+    // Use a placeholder key when none is set so the TUI can start; real auth
+    // errors surface when the user sends their first message.
+    // Kimi Code API requires a recognised Coding Agent User-Agent.
+    const ua = providerId === "kimi-code" ? "KimiCLI/0.63" : "HelixCLI/1.5";
     return new OpenAI({
-      apiKey: provider.api_key || undefined,
-      baseURL: provider.base_url,
-      defaultHeaders: { "User-Agent": "KimiCLI/1.5" },
+      apiKey: apiKey || "unset",
+      baseURL,
+      defaultHeaders: { "User-Agent": ua },
     });
   }
 
   private resolveModel(): string {
-    return process.env.KIMI_MODEL || getActiveModel();
+    const envModel = process.env.KIMI_MODEL;
+    if (envModel) return envModel;
+
+    const providerId = loadConfig().active_provider;
+    const envModelMap: Record<string, string | undefined> = {
+      openai: process.env.OPENAI_MODEL,
+      anthropic: process.env.ANTHROPIC_MODEL,
+      "google-genai": process.env.GOOGLE_MODEL,
+      vertexai: process.env.GOOGLE_MODEL,
+      kimi: process.env.KIMI_MODEL,
+    };
+    return envModelMap[providerId] || getActiveModel();
   }
 
   private resolveProvider() {
-    const envKey = process.env.KIMI_API_KEY;
-    const envUrl = process.env.KIMI_BASE_URL;
-    // If env vars are set, they take precedence for backward compatibility.
-    if (envKey) {
-      const provider = getActiveProvider();
-      return {
-        name: provider.name,
-        base_url: envUrl || provider.base_url,
-        api_key: envKey,
-      };
-    }
-    return getActiveProvider();
+    const providerId = loadConfig().active_provider;
+    const provider = getActiveProvider();
+    const apiKey = resolveApiKey(providerId, provider);
+    const baseUrl = resolveBaseUrl(providerId, provider);
+    return {
+      name: provider.name,
+      base_url: baseUrl,
+      api_key: apiKey,
+    };
   }
 
   // -- CommandContext implementation ---------------------------------------
@@ -232,11 +322,16 @@ export class ChatScreen implements Component, Focusable {
       lines.push(this.frameLine(line, innerWidth));
     }
 
-    // Model info line
+    // Model info line — show provider or hint to set one up
+    const provider = getActiveProvider();
+    const providerId = loadConfig().active_provider;
+    const providerHasKey = hasApiKey(providerId, provider);
+    const typeIcon = this.providerIcon(providerId);
     const model = this.model;
-    const thinking = this.thinkingEnabled();
-    const thinkingIcon = thinking ? "💭" : "  ";
-    const info = `${DIM}${model} · ${thinkingIcon}${RESET}`;
+    const showThinking = this.thinkingEnabled() && this.currentModelSupportsThinking();
+    const info = providerHasKey
+      ? `${DIM}${typeIcon} ${provider.name} · ${model}${showThinking ? ` · 💭 thinking` : ""}${RESET}`
+      : `${DIM}${typeIcon} ${provider.name}${RESET}  ${YELLOW}(no API key — type /provider)${RESET}`;
     lines.push(this.frameLine(info, innerWidth));
 
     lines.push(this.bottomBorder(safeWidth, this.status));
@@ -272,12 +367,18 @@ export class ChatScreen implements Component, Focusable {
     this.activeRequest = controller;
 
     try {
+      // Build request body — only pass thinking for models that support it
+      const body: Record<string, unknown> = {
+        model: this.model,
+        messages: this.conversation,
+        stream: true,
+      };
+      if (this.currentModelSupportsThinking()) {
+        body.thinking = { type: this.thinkingEnabled() ? "enabled" : "disabled" };
+      }
       const stream = await this.client.chat.completions.create(
-        {
-          model: this.model,
-          messages: this.conversation,
-          stream: true,
-        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        body as any,
         {
           signal: controller.signal,
         },
@@ -349,7 +450,7 @@ export class ChatScreen implements Component, Focusable {
   private renderMessages(width: number, maxRows: number): string[] {
     const rendered: string[] = [];
     const reasonPrefix = `${DIM}${YELLOW}> ${RESET}${DIM}`;
-    const showReasoning = this.thinkingEnabled();
+    const showReasoning = this.thinkingEnabled() && this.currentModelSupportsThinking();
 
     for (const message of this.messages) {
       // Render reasoning first (dimmed yellow) — only when thinking is enabled

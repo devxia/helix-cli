@@ -5,18 +5,49 @@ import {
   type SelectItem,
   SelectList,
   type SelectListTheme,
+  type SelectListLayoutOptions,
+  matchesKey,
+  Key,
+  fuzzyFilter,
 } from "@earendil-works/pi-tui";
-import { listProviders, setProvider } from "../config.js";
+import {
+  type ProviderType,
+  type ModelDef,
+  addCustomProvider,
+  listProviders,
+  removeProvider,
+  setProvider,
+  setProviderModels,
+  getActiveModel,
+  setActiveModel,
+  isThinkingEnabled,
+  setThinkingEnabled,
+  loadConfig,
+  hasApiKey,
+  resolveApiKey,
+} from "../config.js";
+import {
+  type CatalogEntry,
+  fetchCatalog,
+  inferProviderType,
+  catalogBaseUrl,
+  catalogModels,
+} from "../catalog.js";
 import type { CommandContext } from "./index.js";
 
 // ---------------------------------------------------------------------------
-// Theme
+// Theme & ANSI
 // ---------------------------------------------------------------------------
 
 const RESET = "\x1b[0m";
+const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 const CYAN = "\x1b[36m";
 const GREEN = "\x1b[32m";
+const YELLOW = "\x1b[33m";
+const RED = "\x1b[31m";
+const BLUE = "\x1b[34m";
+const MAGENTA = "\x1b[35m";
 
 const selectTheme: SelectListTheme = {
   selectedPrefix: (text) => `${CYAN}${text}${RESET}`,
@@ -26,101 +57,684 @@ const selectTheme: SelectListTheme = {
   noMatch: (text) => `${DIM}${text}${RESET}`,
 };
 
+const selectLayout: SelectListLayoutOptions = {
+  maxPrimaryColumnWidth: 24,
+};
+
 // ---------------------------------------------------------------------------
-// ProviderCommandUI — 2-phase inline component
+// Provider icon helper — same map as model.ts and chat.ts
 // ---------------------------------------------------------------------------
 
-type Phase = "select" | "input";
+function providerIcon(providerId: string): string {
+  const iconMap: Record<string, string> = {
+    kimi: "🌙",
+    "kimi-code": "💻",
+    "moonshot-cn": "🌙",
+    "moonshot-ai": "🌙",
+    openai: "⚡",
+    anthropic: "◈",
+    "google-genai": "🔷",
+    vertexai: "🔷",
+    deepseek: "🔮",
+    qwen: "🧩",
+    siliconflow: "🌊",
+    volcengine: "🌋",
+    zhipu: "🔮",
+    minimax: "🎯",
+    yi: "✨",
+    baichuan: "🏔️",
+    mistral: "🌀",
+    groq: "⚡",
+    xai: "✖",
+    togetherai: "🤝",
+    fireworks: "🎆",
+    openrouter: "🔀",
+    perplexity: "🔍",
+    cohere: "🔷",
+    deepinfra: "🏗️",
+    cerebras: "🧠",
+  };
+  return iconMap[providerId] ?? "⚡";
+}
 
-/**
- * Inline UI component that replaces the editor while the user configures
- * a provider.  Phase 1 = select provider, phase 2 = enter API key.
- */
+// ---------------------------------------------------------------------------
+// Phase types
+// ---------------------------------------------------------------------------
+
+type Phase =
+  | "loading"
+  | "manager"
+  | "add-source"
+  | "catalog-list"
+  | "api-key"
+  | "model-pick"
+  | "custom-name"
+  | "custom-type"
+  | "custom-url"
+  | "custom-key";
+
+// ---------------------------------------------------------------------------
+// ProviderCommandUI — multi-phase inline component
+// ---------------------------------------------------------------------------
+
 class ProviderCommandUI implements Component, Focusable {
   focused = false;
 
-  private phase: Phase = "select";
-  private selectedId = "";
-  private selectedLabel = "";
+  private phase: Phase = "loading";
+  private catalog: Map<string, CatalogEntry> = new Map();
+  private catalogItems: SelectItem[] = [];
+  private filteredCatalogItems: SelectItem[] = [];
+  private catalogSearch = "";
+  private abortController: AbortController | null = null;
 
-  private readonly selectList: SelectList;
-  private readonly input: Input;
+  // Selected provider state
+  private selectedProviderId = "";
+  private selectedProviderName = "";
+  private selectedBaseUrl = "";
+  private selectedType: ProviderType = "openai";
+  private selectedModels: ModelDef[] = [];
+
+  // Custom provider state
+  private customName = "";
+  private customType: ProviderType = "openai";
+  private customBaseUrl = "";
+
+  // Delete confirmation
+  private deleteTarget: string | null = null;
+
+  // Track the phase we came from before api-key input
+  private apiKeyReturnPhase: Phase = "catalog-list";
+
+  // UI components
+  private managerList!: SelectList;
+  private addSourceList!: SelectList;
+  private catalogList!: SelectList;
+  private apiKeyInput!: Input;
+  private modelList!: SelectList;
+  private customNameInput!: Input;
+  private customTypeList!: SelectList;
+  private customUrlInput!: Input;
+  private customKeyInput!: Input;
+
   private readonly ctx: CommandContext;
 
   constructor(ctx: CommandContext) {
     this.ctx = ctx;
+    this.initComponents();
+    this.startCatalogFetch();
+  }
 
-    const providers = listProviders();
-    const items: SelectItem[] = providers.map((p) => ({
-      value: p.id,
-      label: p.name,
-      description: p.base_url,
-    }));
+  private initComponents(): void {
+    // Manager list — populated later
+    this.managerList = new SelectList([], 10, selectTheme, selectLayout);
+    this.managerList.onSelect = (item) => this.handleManagerSelect(item);
+    this.managerList.onCancel = () => this.ctx.done();
 
-    this.selectList = new SelectList(items, 10, selectTheme);
-
-    this.selectList.onSelect = (item) => {
-      this.selectedId = item.value;
-      this.selectedLabel = item.label;
-      this.phase = "input";
-      this.input.setValue("");
+    // Add source picker
+    this.addSourceList = new SelectList(
+      [
+        { value: "catalog", label: "📋 Known Provider", description: "Browse 100+ providers from models.dev" },
+        { value: "custom", label: "🔧 Custom Provider", description: "Enter your own base URL and API key" },
+      ],
+      4,
+      selectTheme,
+    );
+    this.addSourceList.onSelect = (item) => {
+      if (item.value === "catalog") {
+        this.phase = "catalog-list";
+        this.catalogSearch = "";
+        this.rebuildCatalogList();
+      } else {
+        this.phase = "custom-name";
+        this.customNameInput.setValue("");
+      }
+      this.ctx.showComponent(this);
+    };
+    this.addSourceList.onCancel = () => {
+      this.phase = "manager";
       this.ctx.showComponent(this);
     };
 
-    this.selectList.onCancel = () => {
-      this.ctx.done();
+    // Catalog list — populated later
+    this.catalogList = new SelectList([], 12, selectTheme, selectLayout);
+    this.catalogList.onSelect = (item) => this.handleCatalogSelect(item);
+    this.catalogList.onCancel = () => {
+      this.phase = "add-source";
+      this.ctx.showComponent(this);
     };
 
-    this.input = new Input();
-
-    this.input.onSubmit = (key) => {
+    // API key input
+    this.apiKeyInput = new Input();
+    this.apiKeyInput.onSubmit = (key) => {
       const trimmed = key.trim();
       if (!trimmed) return;
+      this.applyProvider(trimmed);
+    };
+    this.apiKeyInput.onEscape = () => {
+      this.phase = this.apiKeyReturnPhase;
+      this.ctx.showComponent(this);
+    };
 
-      setProvider(this.selectedId, trimmed);
+    // Model picker — populated later
+    this.modelList = new SelectList([], 12, selectTheme, selectLayout);
+    this.modelList.onSelect = (item) => {
+      setActiveModel(item.value);
       this.ctx.addSystemMessage(
-        `${GREEN}Provider set to ${this.selectedLabel}.${RESET}`,
+        `${GREEN}Model set to ${item.label}.${RESET}`,
       );
       this.ctx.applyProvider();
       this.ctx.done();
     };
+    this.modelList.onCancel = () => {
+      this.ctx.applyProvider();
+      this.ctx.done();
+    };
 
-    this.input.onEscape = () => {
-      this.phase = "select";
+    // Custom name input
+    this.customNameInput = new Input();
+    this.customNameInput.onSubmit = (value) => {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      this.customName = trimmed;
+      this.phase = "custom-type";
+      this.ctx.showComponent(this);
+    };
+    this.customNameInput.onEscape = () => {
+      this.phase = "add-source";
+      this.ctx.showComponent(this);
+    };
+
+    // Custom type selector
+    this.customTypeList = new SelectList(
+      [
+        { value: "openai", label: "⚡ OpenAI-compatible", description: "Most providers (DeepSeek, Qwen, etc.)" },
+        { value: "anthropic", label: "◈ Anthropic (Claude)", description: "Claude Messages API" },
+        { value: "google-genai", label: "🔷 Google GenAI (Gemini)", description: "Gemini API" },
+      ],
+      5,
+      selectTheme,
+    );
+    this.customTypeList.onSelect = (item) => {
+      this.customType = item.value as ProviderType;
+      this.phase = "custom-url";
+      this.customUrlInput.setValue("");
+      this.ctx.showComponent(this);
+    };
+    this.customTypeList.onCancel = () => {
+      this.phase = "custom-name";
+      this.ctx.showComponent(this);
+    };
+
+    // Custom URL input
+    this.customUrlInput = new Input();
+    this.customUrlInput.onSubmit = (value) => {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      this.customBaseUrl = trimmed;
+      this.phase = "custom-key";
+      this.customKeyInput.setValue("");
+      this.ctx.showComponent(this);
+    };
+    this.customUrlInput.onEscape = () => {
+      this.phase = "custom-type";
+      this.ctx.showComponent(this);
+    };
+
+    // Custom key input
+    this.customKeyInput = new Input();
+    this.customKeyInput.onSubmit = (key) => {
+      const trimmed = key.trim();
+      if (!trimmed) return;
+      const safeId = this.customName
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+      addCustomProvider(safeId, this.customName, this.customType, this.customBaseUrl, trimmed);
+      this.ctx.addSystemMessage(
+        `${GREEN}Custom provider "${this.customName}" added and activated.${RESET}`,
+      );
+      this.ctx.applyProvider();
+      this.ctx.done();
+    };
+    this.customKeyInput.onEscape = () => {
+      this.phase = "custom-url";
       this.ctx.showComponent(this);
     };
   }
 
-  // -- Component ----------------------------------------------------------
+  // -- Catalog fetch -------------------------------------------------------
 
-  render(width: number): string[] {
-    if (this.phase === "select") {
-      const lines = this.selectList.render(width);
-      lines.unshift(` ${GREEN}Select a provider:${RESET}`);
-      lines.unshift("");
-      lines.push("");
-      lines.push(` ${DIM}↑↓ navigate  ↵ select  Esc cancel${RESET}`);
-      return lines;
+  private async startCatalogFetch(): Promise<void> {
+    this.abortController = new AbortController();
+    try {
+      this.catalog = await fetchCatalog(this.abortController.signal);
+      this.buildCatalogItems();
+      if (this.phase === "loading") {
+        this.phase = "manager";
+        this.rebuildManagerList();
+        this.ctx.showComponent(this);
+      }
+    } catch {
+      if (this.phase === "loading") {
+        this.phase = "manager";
+        this.rebuildManagerList();
+        this.ctx.showComponent(this);
+      }
     }
-    const lines = this.input.render(width);
-    lines.unshift(` ${GREEN}Enter API key for ${this.selectedLabel}:${RESET}`);
-    lines.unshift("");
-    lines.push("");
-    lines.push(` ${DIM}↵ confirm  Esc back${RESET}`);
-    return lines;
   }
 
-  handleInput(data: string): void {
-    if (this.phase === "select") {
-      this.selectList.handleInput(data);
+  private buildCatalogItems(): void {
+    this.catalogItems = [];
+    for (const [id, entry] of this.catalog) {
+      const type = inferProviderType(entry);
+      if (!type) continue;
+      const modelCount = Object.keys(entry.models).length;
+      this.catalogItems.push({
+        value: id,
+        label: `${providerIcon(id)} ${entry.name || id}`,
+        description: `${modelCount} models`,
+      });
+    }
+    // Sort: providers with more models first
+    this.catalogItems.sort((a, b) => {
+      const countA = parseInt(a.description ?? "0");
+      const countB = parseInt(b.description ?? "0");
+      return countB - countA;
+    });
+    this.filteredCatalogItems = this.catalogItems;
+  }
+
+  private rebuildCatalogList(): void {
+    const query = this.catalogSearch.toLowerCase();
+    if (query) {
+      this.filteredCatalogItems = fuzzyFilter(
+        this.catalogItems,
+        query,
+        (item) => `${item.label} ${item.description ?? ""}`,
+      );
     } else {
-      this.input.handleInput(data);
+      this.filteredCatalogItems = this.catalogItems;
+    }
+    this.catalogList = new SelectList(this.filteredCatalogItems, 12, selectTheme, selectLayout);
+    this.catalogList.onSelect = (item) => this.handleCatalogSelect(item);
+    this.catalogList.onCancel = () => {
+      this.phase = "add-source";
+      this.ctx.showComponent(this);
+    };
+  }
+
+  // -- Manager list ---------------------------------------------------------
+
+  private rebuildManagerList(): void {
+    const providers = listProviders();
+    const config = loadConfig();
+    const items: SelectItem[] = providers.map((p) => {
+      const isActive = p.id === config.active_provider;
+      const hasKey = !!resolveApiKey(p.id, p).length;
+      const icon = providerIcon(p.id);
+      const keyHint = hasKey ? `${GREEN}key ✓${RESET}` : `${YELLOW}no key${RESET}`;
+      const activeMark = isActive && hasKey ? `${GREEN}active${RESET}` : "";
+      const parts = [keyHint];
+      if (activeMark) parts.push(activeMark);
+      return {
+        value: p.id,
+        label: `${icon} ${p.name}`,
+        description: parts.join(" · "),
+      };
+    });
+    items.push({
+      value: "__add__",
+      label: `${CYAN}＋ Add Provider${RESET}`,
+      description: "Browse catalog or add custom endpoint",
+    });
+    this.managerList = new SelectList(items, 10, selectTheme, selectLayout);
+    this.managerList.onSelect = (item) => this.handleManagerSelect(item);
+    this.managerList.onCancel = () => this.ctx.done();
+  }
+
+  private handleManagerSelect(item: SelectItem): void {
+    if (item.value === "__add__") {
+      this.phase = "add-source";
+      this.ctx.showComponent(this);
+      return;
+    }
+    // Select existing provider — go to API key input
+    this.selectedProviderId = item.value;
+    this.selectedProviderName = item.label;
+    const provider = loadConfig().providers[item.value];
+    if (provider) {
+      this.selectedBaseUrl = provider.base_url;
+      this.selectedType = provider.type;
+    }
+    this.phase = "api-key";
+    this.apiKeyReturnPhase = "manager";
+    this.apiKeyInput.setValue(provider?.api_key ?? "");
+    this.ctx.showComponent(this);
+  }
+
+  // -- Catalog selection ----------------------------------------------------
+
+  private handleCatalogSelect(item: SelectItem): void {
+    const entry = this.catalog.get(item.value);
+    if (!entry) return;
+
+    const type = inferProviderType(entry);
+    if (!type) return;
+
+    this.selectedProviderId = item.value;
+    this.selectedProviderName = entry.name || item.value;
+    this.selectedBaseUrl = catalogBaseUrl(entry, type);
+    this.selectedType = type;
+    this.selectedModels = catalogModels(entry);
+
+    this.phase = "api-key";
+    this.apiKeyReturnPhase = "catalog-list";
+    this.apiKeyInput.setValue("");
+    this.ctx.showComponent(this);
+  }
+
+  // -- Apply provider -------------------------------------------------------
+
+  private applyProvider(apiKey: string): void {
+    const existing = loadConfig().providers[this.selectedProviderId];
+    if (existing) {
+      setProvider(this.selectedProviderId, apiKey);
+    } else {
+      addCustomProvider(
+        this.selectedProviderId,
+        this.selectedProviderName,
+        this.selectedType,
+        this.selectedBaseUrl,
+        apiKey,
+        this.selectedModels.length > 0 ? this.selectedModels : undefined,
+      );
+    }
+
+    if (this.selectedModels.length > 0) {
+      setProviderModels(this.selectedProviderId, this.selectedModels);
+    }
+
+    this.ctx.addSystemMessage(
+      `${GREEN}Provider set to ${providerIcon(this.selectedProviderId)} ${this.selectedProviderName}.${RESET}`,
+    );
+
+    if (this.selectedModels.length > 0) {
+      this.phase = "model-pick";
+      const modelItems: SelectItem[] = this.selectedModels.map((m) => ({
+        value: m.id,
+        label: m.label,
+        description: m.description ?? "",
+      }));
+      this.modelList = new SelectList(modelItems, 12, selectTheme, selectLayout);
+      this.modelList.onSelect = (mi) => {
+        setActiveModel(mi.value);
+        this.ctx.addSystemMessage(`${GREEN}Model set to ${mi.label}.${RESET}`);
+        this.ctx.applyProvider();
+        this.ctx.done();
+      };
+      this.modelList.onCancel = () => {
+        this.ctx.applyProvider();
+        this.ctx.done();
+      };
+      this.ctx.showComponent(this);
+    } else {
+      this.ctx.applyProvider();
+      this.ctx.done();
+    }
+  }
+
+  // -- Component ------------------------------------------------------------
+
+  render(width: number): string[] {
+    switch (this.phase) {
+      case "loading":
+        return this.renderLoading();
+      case "manager":
+        return this.renderManager(width);
+      case "add-source":
+        return this.renderAddSource(width);
+      case "catalog-list":
+        return this.renderCatalogList(width);
+      case "api-key":
+        return this.renderApiKey(width);
+      case "model-pick":
+        return this.renderModelPick(width);
+      case "custom-name":
+        return this.renderCustomName(width);
+      case "custom-type":
+        return this.renderCustomType(width);
+      case "custom-url":
+        return this.renderCustomUrl(width);
+      case "custom-key":
+        return this.renderCustomKey(width);
+    }
+  }
+
+  // ── Phase renderers ────────────────────────────────────────────
+
+  private renderLoading(): string[] {
+    return [
+      "",
+      ` ${CYAN}⏳${RESET} ${BOLD}Loading provider catalog...${RESET}`,
+      ` ${DIM}Fetching from models.dev${RESET}`,
+      "",
+    ];
+  }
+
+  private renderManager(width: number): string[] {
+    const lines = this.managerList.render(width);
+    const deleteHint = this.deleteTarget
+      ? ` ${RED}✕ Delete "${this.deleteTarget}"? [y/N]${RESET}`
+      : ` ${DIM}↑↓ navigate · ↵ select · d delete · Esc close${RESET}`;
+    return [
+      "",
+      ` ${BOLD}⚙ Providers${RESET}`,
+      deleteHint,
+      ...lines,
+      "",
+    ];
+  }
+
+  private renderAddSource(width: number): string[] {
+    const lines = this.addSourceList.render(width);
+    return [
+      "",
+      ` ${BOLD}＋ Add Provider${RESET}`,
+      ` ${DIM}Choose how to add a new provider${RESET}`,
+      ...lines,
+      "",
+      ` ${DIM}↑↓ navigate · ↵ select · Esc back${RESET}`,
+    ];
+  }
+
+  private renderCatalogList(width: number): string[] {
+    const searchLine = this.catalogSearch
+      ? ` ${CYAN}🔍 ${this.catalogSearch}█${RESET}`
+      : ` ${DIM}🔍 Type to search...${RESET}`;
+    const lines = this.catalogList.render(width);
+    const count = this.filteredCatalogItems.length;
+    return [
+      "",
+      ` ${BOLD}📋 Provider Catalog${RESET}  ${DIM}(${count} available)${RESET}`,
+      searchLine,
+      ...lines,
+      "",
+      ` ${DIM}↑↓ navigate · ↵ select · type to filter · Esc back${RESET}`,
+    ];
+  }
+
+  private renderApiKey(width: number): string[] {
+    const lines = this.apiKeyInput.render(width);
+    const icon = providerIcon(this.selectedProviderId);
+    return [
+      "",
+      ` ${icon} ${BOLD}${this.selectedProviderName}${RESET}`,
+      ` ${DIM}Enter your API key${RESET}`,
+      ...lines,
+      "",
+      ` ${DIM}↵ confirm · Esc back${RESET}`,
+    ];
+  }
+
+  private renderModelPick(width: number): string[] {
+    const lines = this.modelList.render(width);
+    return [
+      "",
+      ` ${BOLD}🎯 Select Default Model${RESET}`,
+      ` ${DIM}${this.selectedProviderName} · ${this.selectedModels.length} models${RESET}`,
+      ...lines,
+      "",
+      ` ${DIM}↑↓ navigate · ↵ select · Esc skip${RESET}`,
+    ];
+  }
+
+  private renderCustomName(width: number): string[] {
+    const lines = this.customNameInput.render(width);
+    return [
+      "",
+      ` ${BOLD}🔧 Custom Provider${RESET}  ${DIM}Step 1/4${RESET}`,
+      ` ${DIM}Enter a display name${RESET}`,
+      ...lines,
+      "",
+      ` ${DIM}↵ confirm · Esc back${RESET}`,
+    ];
+  }
+
+  private renderCustomType(width: number): string[] {
+    const lines = this.customTypeList.render(width);
+    return [
+      "",
+      ` ${BOLD}🔧 Custom: "${this.customName}"${RESET}  ${DIM}Step 2/4${RESET}`,
+      ` ${DIM}Select API protocol${RESET}`,
+      ...lines,
+      "",
+      ` ${DIM}↑↓ navigate · ↵ select · Esc back${RESET}`,
+    ];
+  }
+
+  private renderCustomUrl(width: number): string[] {
+    const lines = this.customUrlInput.render(width);
+    return [
+      "",
+      ` ${BOLD}🔧 Custom: "${this.customName}"${RESET}  ${DIM}Step 3/4${RESET}`,
+      ` ${DIM}Enter base URL (${this.customType})${RESET}`,
+      ...lines,
+      "",
+      ` ${DIM}↵ confirm · Esc back${RESET}`,
+    ];
+  }
+
+  private renderCustomKey(width: number): string[] {
+    const lines = this.customKeyInput.render(width);
+    return [
+      "",
+      ` ${BOLD}🔧 Custom: "${this.customName}"${RESET}  ${DIM}Step 4/4${RESET}`,
+      ` ${DIM}Enter API key${RESET}`,
+      ...lines,
+      "",
+      ` ${DIM}↵ confirm · Esc back${RESET}`,
+    ];
+  }
+
+  // -- Input handling -------------------------------------------------------
+
+  handleInput(data: string): void {
+    // Global: delete confirmation in manager
+    if (this.deleteTarget !== null) {
+      if (matchesKey(data, Key.y)) {
+        removeProvider(this.deleteTarget);
+        this.ctx.addSystemMessage(`${YELLOW}Provider "${this.deleteTarget}" removed.${RESET}`);
+        this.deleteTarget = null;
+        this.rebuildManagerList();
+        this.ctx.showComponent(this);
+      } else {
+        this.deleteTarget = null;
+        this.ctx.showComponent(this);
+      }
+      return;
+    }
+
+    // Phase-specific input
+    switch (this.phase) {
+      case "loading":
+        break;
+      case "manager":
+        if (data === "d" || data === "D") {
+          const selected = this.managerList.getSelectedItem();
+          if (selected && selected.value !== "__add__") {
+            this.deleteTarget = selected.value;
+            this.ctx.showComponent(this);
+          }
+          return;
+        }
+        this.managerList.handleInput(data);
+        break;
+      case "add-source":
+        this.addSourceList.handleInput(data);
+        break;
+      case "catalog-list":
+        if (matchesKey(data, Key.escape)) {
+          if (this.catalogSearch) {
+            this.catalogSearch = "";
+            this.rebuildCatalogList();
+            this.ctx.showComponent(this);
+          } else {
+            this.phase = "add-source";
+            this.ctx.showComponent(this);
+          }
+          return;
+        }
+        if (matchesKey(data, Key.backspace)) {
+          if (this.catalogSearch.length > 0) {
+            this.catalogSearch = this.catalogSearch.slice(0, -1);
+            this.rebuildCatalogList();
+            this.ctx.showComponent(this);
+          }
+          return;
+        }
+        if (matchesKey(data, Key.enter)) {
+          this.catalogList.handleInput(data);
+          return;
+        }
+        if (data.length === 1 && data >= " ") {
+          this.catalogSearch += data;
+          this.rebuildCatalogList();
+          this.ctx.showComponent(this);
+          return;
+        }
+        this.catalogList.handleInput(data);
+        break;
+      case "api-key":
+        this.apiKeyInput.handleInput(data);
+        break;
+      case "model-pick":
+        this.modelList.handleInput(data);
+        break;
+      case "custom-name":
+        this.customNameInput.handleInput(data);
+        break;
+      case "custom-type":
+        this.customTypeList.handleInput(data);
+        break;
+      case "custom-url":
+        this.customUrlInput.handleInput(data);
+        break;
+      case "custom-key":
+        this.customKeyInput.handleInput(data);
+        break;
     }
   }
 
   invalidate(): void {
-    this.selectList.invalidate();
-    this.input.invalidate();
+    this.managerList.invalidate();
+    this.addSourceList.invalidate();
+    this.catalogList.invalidate();
+    this.apiKeyInput.invalidate();
+    this.modelList.invalidate();
+    this.customNameInput.invalidate();
+    this.customTypeList.invalidate();
+    this.customUrlInput.invalidate();
+    this.customKeyInput.invalidate();
   }
 }
 

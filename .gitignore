@@ -19,6 +19,10 @@ build/
 npm-debug.log*
 bun-debug.log*
 
+# IDE
+.vscode/
+.idea/
+
 # Temp/cache
 .tmp/
 temp/
