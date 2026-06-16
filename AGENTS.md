@@ -21,7 +21,7 @@ Repository-level Agent Guide
 | 运行时 | Bun 1.2+ | 仅当 Bun 停止维护时可退至 Node.js + tsx |
 | TUI | pi-TUI (`@earendil-works/pi-tui`) | 仅当项目停止维护时可考虑 blessed |
 | Agent | LangGraph TS (`@langchain/langgraph`) | 不接受替换 |
-| LLM SDK | OpenAI SDK (`openai` + base_url) | 不接受替换 |
+| LLM SDK | OpenAI SDK (`openai` + base_url) 为主；Anthropic (`@anthropic-ai/sdk`)、Google GenAI (`@google/genai`) 用于原生协议 | 不接受替换 OpenAI SDK 的核心地位；新增原生 SDK 需经 ADR |
 | 数据 | bun:sqlite | 不接受替换 |
 | 验证 | Zod | 不接受替换 |
 | 分发 | `bun build --compile` | 仅当 Bun 取消该功能时可退至 pkg |

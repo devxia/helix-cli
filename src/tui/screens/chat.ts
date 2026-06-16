@@ -8,9 +8,10 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
   CombinedAutocompleteProvider,
+  matchesKey,
 } from "@earendil-works/pi-tui";
-import OpenAI from "openai";
 import {
+  type ProviderConfig,
   getActiveProvider,
   getActiveModel,
   getAvailableModels,
@@ -20,27 +21,28 @@ import {
   loadConfig,
   resolveApiKey,
   resolveBaseUrl,
+  setProviderModels,
+  setThinkingEnabled,
 } from "../../config.js";
 import { type CommandContext, registry } from "../../commands/index.js";
 import { executeProviderCommand } from "../../commands/provider.js";
 import { executeModelCommand } from "../../commands/model.js";
 import { preloadCatalogModels } from "../../catalog.js";
-import { setProviderModels } from "../../config.js";
+import { createLLMProvider } from "../../llm/factory.js";
+import type { LLMProvider } from "../../llm/provider.js";
+import type { LLMEvent } from "../../llm/types.js";
+import { providerIcon } from "../../utils/icons.js";
 
 type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
-  reasoning?: string;
+  thinking?: string;
+  thinkingExpanded?: boolean;
 };
-
-/** Kimi API extends the standard delta with a reasoning_content field. */
-interface DeltaWithReasoning {
-  content?: string | null;
-  reasoning_content?: string;
-}
 
 const RESET = "\x1b[0m";
 const DIM = "\x1b[2m";
+const BOLD = "\x1b[1m";
 const CYAN = "\x1b[36m";
 const GREEN = "\x1b[32m";
 const RED = "\x1b[31m";
@@ -61,10 +63,10 @@ export class ChatScreen implements Component, Focusable {
   focused = false;
 
   private readonly editor: Editor;
-  private client: OpenAI;
+  private provider: LLMProvider;
   private model: string;
   private readonly conversation: Array<{ role: "user" | "assistant"; content: string }> = [];
-  private readonly messages: ChatMessage[] = [
+  private messages: ChatMessage[] = [
     {
       role: "system",
       content: "Ready. Type a message and press Enter.",
@@ -73,15 +75,19 @@ export class ChatScreen implements Component, Focusable {
   private activeRequest: AbortController | null = null;
   private exitOnNextInterrupt = false;
   private status = "Idle";
+  private showHelpOverlay = false;
+  /** Separate input history so Alt+↑/↓ works even inside multi-line input. */
+  private inputHistory: string[] = [];
+  private inputHistoryIndex = -1;
   /** When set, the editor is replaced by a command UI component. */
   private commandComponent: Component | null = null;
 
   constructor(private readonly tui: TUI) {
-    this.client = this.createClient();
+    this.provider = this.createProvider();
     this.model = this.resolveModel();
 
     // If no provider has a key, show setup guidance
-    const anyKeyConfigured = Object.entries(loadConfig().providers).some(
+    const anyKeyConfigured = Object.entries(loadConfig().providers as Record<string, ProviderConfig>).some(
       ([id, p]) => hasApiKey(id, p),
     );
     if (!anyKeyConfigured) {
@@ -145,55 +151,17 @@ export class ChatScreen implements Component, Focusable {
     return current?.reasoning === true;
   }
 
-  private providerIcon(providerId: string): string {
-    const iconMap: Record<string, string> = {
-      kimi: "🌙",
-      "kimi-code": "💻",
-      "moonshot-cn": "🌙",
-      "moonshot-ai": "🌙",
-      openai: "⚡",
-      anthropic: "◈",
-      "google-genai": "🔷",
-      vertexai: "🔷",
-      deepseek: "🔮",
-      qwen: "🧩",
-      siliconflow: "🌊",
-      volcengine: "🌋",
-      zhipu: "🔮",
-      minimax: "🎯",
-      yi: "✨",
-      baichuan: "🏔️",
-      mistral: "🌀",
-      groq: "⚡",
-      xai: "✖",
-      togetherai: "🤝",
-      fireworks: "🎆",
-      openrouter: "🔀",
-      perplexity: "🔍",
-      cohere: "🔷",
-      deepinfra: "🏗️",
-      cerebras: "🧠",
-    };
-    return iconMap[providerId] ?? "⚡";
-  }
 
-  private createClient(): OpenAI {
+
+  private createProvider(): LLMProvider {
     const provider = getActiveProvider();
     const providerId = loadConfig().active_provider;
     const apiKey = resolveApiKey(providerId, provider);
     const baseURL = resolveBaseUrl(providerId, provider);
 
-    // TODO: anthropic and google-genai types need their own SDKs.
-    // For now we use the OpenAI SDK for all types (it works for openai-compatible).
     // Use a placeholder key when none is set so the TUI can start; real auth
     // errors surface when the user sends their first message.
-    // Kimi Code API requires a recognised Coding Agent User-Agent.
-    const ua = providerId === "kimi-code" ? "KimiCLI/0.63" : "HelixCLI/1.5";
-    return new OpenAI({
-      apiKey: apiKey || "unset",
-      baseURL,
-      defaultHeaders: { "User-Agent": ua },
-    });
+    return createLLMProvider(providerId, provider, apiKey, baseURL);
   }
 
   private resolveModel(): string {
@@ -240,7 +208,7 @@ export class ChatScreen implements Component, Focusable {
         this.messages.push({ role: "system", content: text });
       },
       applyProvider: () => {
-        this.client = this.createClient();
+        this.provider = this.createProvider();
         this.model = this.resolveModel();
         // Refresh model list for the new provider
         const providerId = loadConfig().active_provider;
@@ -269,6 +237,26 @@ export class ChatScreen implements Component, Focusable {
     return true;
   }
 
+  clearChat(): void {
+    // Keep only the initial system welcome message(s)
+    this.messages = this.messages.filter((m) => m.role === "system");
+    this.conversation.length = 0;
+    this.status = "Chat cleared";
+    this.tui.requestRender(true);
+  }
+
+  toggleHelpOverlay(): void {
+    this.showHelpOverlay = !this.showHelpOverlay;
+    this.tui.requestRender(true);
+  }
+
+  toggleThinking(): void {
+    const next = !this.thinkingEnabled();
+    setThinkingEnabled(next);
+    this.status = `Thinking ${next ? "ON" : "OFF"}`;
+    this.tui.requestRender(true);
+  }
+
   handleInput(data: string): void {
     if (this.commandComponent?.handleInput) {
       this.commandComponent.handleInput(data);
@@ -280,7 +268,47 @@ export class ChatScreen implements Component, Focusable {
     if (!this.activeRequest && this.status === "Press Ctrl+C again to exit.") {
       this.status = "Idle";
     }
+
+    // Toggle thinking expansion for the last assistant message
+    if (data === "t" && !this.commandComponent && !this.activeRequest) {
+      this.toggleLastThinkingExpansion();
+      return;
+    }
+
+    // Alt+↑/↓ cycle input history even inside multi-line input
+    if (matchesKey(data, "alt+up")) {
+      this.cycleInputHistory(-1);
+      return;
+    }
+    if (matchesKey(data, "alt+down")) {
+      this.cycleInputHistory(1);
+      return;
+    }
+
     this.editor.handleInput(data);
+  }
+
+  private cycleInputHistory(direction: -1 | 1): void {
+    if (this.inputHistory.length === 0) return;
+
+    const nextIndex = this.inputHistoryIndex + direction;
+    if (nextIndex < -1 || nextIndex >= this.inputHistory.length) return;
+
+    this.inputHistoryIndex = nextIndex;
+    const text = this.inputHistory[this.inputHistoryIndex] ?? "";
+    this.editor.setText(text);
+    this.tui.requestRender(true);
+  }
+
+  private toggleLastThinkingExpansion(): void {
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const m = this.messages[i];
+      if (m.role === "assistant" && m.thinking) {
+        m.thinkingExpanded = !m.thinkingExpanded;
+        this.tui.requestRender(true);
+        return;
+      }
+    }
   }
 
   invalidate(): void {
@@ -300,19 +328,23 @@ export class ChatScreen implements Component, Focusable {
       inputLines = this.commandComponent.render(innerWidth);
       inputLabel = " Command ";
     } else {
-      inputLines = this.editor.render(innerWidth).slice(0, Math.max(3, Math.floor(height * 0.3)));
+      const maxInputRows = Math.max(3, Math.floor(height * 0.5));
+      inputLines = this.editor.render(innerWidth).slice(0, maxInputRows);
     }
 
     const fixedRows = 5 + inputLines.length;
     const messageRows = Math.max(1, height - fixedRows);
     const messageLines = this.renderMessages(innerWidth, messageRows);
+    const displayLines = this.showHelpOverlay
+      ? this.renderHelpOverlay(innerWidth, messageRows)
+      : messageLines;
     const lines: string[] = [];
 
     lines.push(this.topBorder(safeWidth));
     lines.push(this.frameLine(`${GREEN}Helix Cli v0.0.2${RESET}`, innerWidth));
-    lines.push(this.separator(safeWidth, " Messages "));
+    lines.push(this.separator(safeWidth, this.showHelpOverlay ? " Help " : " Messages "));
 
-    for (const line of messageLines) {
+    for (const line of displayLines) {
       lines.push(this.frameLine(line, innerWidth));
     }
 
@@ -326,7 +358,7 @@ export class ChatScreen implements Component, Focusable {
     const provider = getActiveProvider();
     const providerId = loadConfig().active_provider;
     const providerHasKey = hasApiKey(providerId, provider);
-    const typeIcon = this.providerIcon(providerId);
+    const typeIcon = providerIcon(providerId);
     const model = this.model;
     const showThinking = this.thinkingEnabled() && this.currentModelSupportsThinking();
     const info = providerHasKey
@@ -356,6 +388,8 @@ export class ChatScreen implements Component, Focusable {
 
     this.exitOnNextInterrupt = false;
     this.editor.addToHistory(input);
+    this.inputHistory.unshift(input);
+    this.inputHistoryIndex = -1;
     this.editor.setText("");
     this.conversation.push({ role: "user", content: input });
     this.messages.push({ role: "user", content: input });
@@ -366,52 +400,43 @@ export class ChatScreen implements Component, Focusable {
     const controller = new AbortController();
     this.activeRequest = controller;
 
+    let reply = "";
+    let thinking = "";
+    let state: "thinking" | "answering" = "thinking";
+
     try {
-      // Build request body — only pass thinking for models that support it
-      const body: Record<string, unknown> = {
-        model: this.model,
-        messages: this.conversation,
-        stream: true,
-      };
-      if (this.currentModelSupportsThinking()) {
-        body.thinking = { type: this.thinkingEnabled() ? "enabled" : "disabled" };
-      }
-      const stream = await this.client.chat.completions.create(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        body as any,
-        {
-          signal: controller.signal,
+      const stream = this.provider.stream({
+        messages: this.toLLMMessages(this.conversation),
+        options: {
+          model: this.model,
+          thinking: this.currentModelSupportsThinking() && this.thinkingEnabled(),
         },
-      );
+      });
 
-      let reply = "";
-      let reasoning = "";
-      let state: "thinking" | "answering" = "thinking";
+      for await (const event of stream) {
+        if (controller.signal.aborted) break;
+        this.handleLLMEvent(event);
 
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta as DeltaWithReasoning | undefined;
-        if (!delta) {
-          continue;
-        }
-
-        const contentDelta = delta.content || "";
-        const reasoningDelta = delta.reasoning_content || "";
-
-        if (reasoningDelta) {
-          reasoning += reasoningDelta;
-          this.status = "Thinking...";
-        }
-        if (contentDelta) {
-          if (state === "thinking") {
-            state = "answering";
+        if (event.type === "content") {
+          if (event.part.type === "think") {
+            thinking += event.part.think;
+            this.status = "Thinking...";
+          } else {
+            if (state === "thinking") {
+              state = "answering";
+            }
+            reply += event.part.text;
+            this.status = "Streaming...";
           }
-          reply += contentDelta;
-          this.status = "Streaming...";
-        }
-
-        if (contentDelta || reasoningDelta) {
-          this.updateLastAssistantMessage(reply, reasoning);
+          this.updateLastAssistantMessage(reply, thinking);
           this.tui.requestRender();
+        } else if (event.type === "status") {
+          // Could surface token usage in status line later.
+        } else if (event.type === "error") {
+          this.messages.push({
+            role: "system",
+            content: `${RED}Error:${RESET} ${event.error.message}`,
+          });
         }
       }
 
@@ -437,32 +462,71 @@ export class ChatScreen implements Component, Focusable {
     }
   }
 
-  private updateLastAssistantMessage(content: string, reasoning?: string): void {
+  private handleLLMEvent(_event: LLMEvent): void {
+    // Hook for future handling (tool calls, subagent events, etc.)
+  }
+
+  private toLLMMessages(
+    conversation: Array<{ role: "user" | "assistant"; content: string }>,
+  ): Array<{ role: "user"; content: [{ type: "text"; text: string }] } | { role: "assistant"; content: [{ type: "text"; text: string }] }> {
+    return conversation.map((m) => ({
+      role: m.role,
+      content: [{ type: "text" as const, text: m.content }],
+    }));
+  }
+
+  private updateLastAssistantMessage(content: string, thinking?: string): void {
     const last = this.messages[this.messages.length - 1];
     if (last?.role === "assistant") {
       last.content = content;
-      if (reasoning) {
-        last.reasoning = reasoning;
+      if (thinking) {
+        last.thinking = thinking;
       }
     }
   }
 
+  private renderHelpOverlay(width: number, maxRows: number): string[] {
+    const rendered: string[] = [];
+    const add = (text: string) => rendered.push(` ${text}`);
+
+    add(`${BOLD}Global shortcuts${RESET}`);
+    add("");
+    add(`${CYAN}Esc${RESET}        Interrupt streaming / exit confirmation`);
+    add(`${CYAN}Ctrl+L${RESET}     Clear chat`);
+    add(`${CYAN}Ctrl+/${RESET}     Toggle this help overlay`);
+    add(`${CYAN}Ctrl+T${RESET}     Toggle thinking mode`);
+    add("");
+    add(`${BOLD}Slash commands${RESET}`);
+    add("");
+    add(`${GREEN}/provider${RESET}  Configure or switch LLM provider`);
+    add(`${GREEN}/model${RESET}     Select model and toggle thinking`);
+    add("");
+    add(`${DIM}Press Ctrl+/ to close${RESET}`);
+
+    while (rendered.length < maxRows) rendered.push("");
+    return rendered.slice(0, maxRows);
+  }
+
   private renderMessages(width: number, maxRows: number): string[] {
     const rendered: string[] = [];
-    const reasonPrefix = `${DIM}${YELLOW}> ${RESET}${DIM}`;
-    const showReasoning = this.thinkingEnabled() && this.currentModelSupportsThinking();
+    const thinkPrefix = `${DIM}${YELLOW}> ${RESET}${DIM}`;
+    const showThinking = this.thinkingEnabled() && this.currentModelSupportsThinking();
 
     for (const message of this.messages) {
-      // Render reasoning first (dimmed yellow) — only when thinking is enabled
-      if (showReasoning && message.role === "assistant" && message.reasoning) {
+      // Render thinking first (dimmed yellow) — only when thinking is enabled and not collapsed
+      const thinkingExpanded = message.thinkingExpanded !== false;
+      if (showThinking && message.role === "assistant" && message.thinking && thinkingExpanded) {
         const wrapped = wrapTextWithAnsi(
-          `${reasonPrefix}${message.reasoning}`,
+          `${thinkPrefix}${message.thinking}`,
           Math.max(1, width - 2),
         );
         for (const line of wrapped) {
           rendered.push(` ${line}`);
         }
-        // Empty separator line between reasoning and answer
+        // Empty separator line between thinking and answer
+        rendered.push("");
+      } else if (showThinking && message.role === "assistant" && message.thinking && !thinkingExpanded) {
+        rendered.push(` ${DIM}[thinking hidden — press ${YELLOW}t${RESET}${DIM} to expand]${RESET}`);
         rendered.push("");
       }
 

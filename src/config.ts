@@ -7,7 +7,7 @@ import { z } from "zod";
 // Provider type
 // ---------------------------------------------------------------------------
 
-export type ProviderType = "openai" | "anthropic" | "google-genai" | "kimi" | "vertexai";
+export type ProviderType = "openai" | "openai_responses" | "anthropic" | "google-genai" | "kimi" | "vertexai";
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -15,7 +15,7 @@ export type ProviderType = "openai" | "anthropic" | "google-genai" | "kimi" | "v
 
 const providerSchema = z.object({
   name: z.string(),
-  type: z.enum(["openai", "anthropic", "google-genai", "kimi", "vertexai"]).default("openai"),
+  type: z.enum(["openai", "openai_responses", "anthropic", "google-genai", "kimi", "vertexai"]).default("openai"),
   base_url: z.string(),
   api_key: z.string().default(""),
 });
@@ -24,7 +24,7 @@ const configSchema = z.object({
   active_provider: z.string().default("kimi"),
   active_model: z.string().default("kimi-k2"),
   thinking: z.boolean().default(true),
-  providers: z.record(providerSchema),
+  providers: z.record(z.string(), providerSchema),
 });
 
 export type ProviderConfig = z.infer<typeof providerSchema>;
@@ -427,7 +427,7 @@ function stringifyConfig(cfg: Config): string {
   lines.push(`active_model = "${cfg.active_model}"`);
   lines.push(`thinking = ${cfg.thinking}`);
   lines.push("");
-  for (const [id, p] of Object.entries(cfg.providers)) {
+  for (const [id, p] of Object.entries(cfg.providers as Record<string, ProviderConfig>)) {
     lines.push(`[providers.${id}]`);
     lines.push(`name = "${p.name}"`);
     lines.push(`type = "${p.type}"`);
@@ -485,12 +485,12 @@ export function saveConfig(cfg: Config): void {
 export function getActiveProvider(): ProviderConfig {
   const cfg = loadConfig();
   const activeId = cfg.active_provider;
-  return cfg.providers[activeId] ?? DEFAULT_PROVIDERS.kimi!;
+  return (cfg.providers as Record<string, ProviderConfig>)[activeId] ?? DEFAULT_PROVIDERS.kimi!;
 }
 
 export function setProvider(providerId: string, apiKey: string): Config {
   const cfg = loadConfig();
-  const provider = cfg.providers[providerId];
+  const provider = (cfg.providers as Record<string, ProviderConfig>)[providerId];
   if (!provider) {
     throw new Error(`Unknown provider: ${providerId}`);
   }
@@ -552,7 +552,7 @@ export function removeProvider(providerId: string): Config {
 
 export function listProviders(): Array<{ id: string } & ProviderConfig> {
   const cfg = loadConfig();
-  return Object.entries(cfg.providers).map(([id, p]) => ({ id, ...p }));
+  return Object.entries(cfg.providers as Record<string, ProviderConfig>).map(([id, p]) => ({ id, ...p }));
 }
 
 /**
@@ -596,7 +596,7 @@ export function resolveBaseUrl(providerId: string, provider: ProviderConfig): st
  */
 export async function refreshProviderModels(providerId: string): Promise<ModelDef[]> {
   const config = loadConfig();
-  const provider = config.providers[providerId];
+  const provider = (config.providers as Record<string, ProviderConfig>)[providerId];
   if (!provider) return FALLBACK_MODELS[providerId] ?? [];
 
   const apiKey = resolveApiKey(providerId, provider);

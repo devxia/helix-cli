@@ -12,6 +12,7 @@ import {
 } from "@earendil-works/pi-tui";
 import {
   type ProviderType,
+  type ProviderConfig,
   type ModelDef,
   addCustomProvider,
   listProviders,
@@ -33,6 +34,7 @@ import {
   catalogBaseUrl,
   catalogModels,
 } from "../catalog.js";
+import { providerIcon } from "../utils/icons.js";
 import type { CommandContext } from "./index.js";
 
 // ---------------------------------------------------------------------------
@@ -60,42 +62,6 @@ const selectTheme: SelectListTheme = {
 const selectLayout: SelectListLayoutOptions = {
   maxPrimaryColumnWidth: 24,
 };
-
-// ---------------------------------------------------------------------------
-// Provider icon helper — same map as model.ts and chat.ts
-// ---------------------------------------------------------------------------
-
-function providerIcon(providerId: string): string {
-  const iconMap: Record<string, string> = {
-    kimi: "🌙",
-    "kimi-code": "💻",
-    "moonshot-cn": "🌙",
-    "moonshot-ai": "🌙",
-    openai: "⚡",
-    anthropic: "◈",
-    "google-genai": "🔷",
-    vertexai: "🔷",
-    deepseek: "🔮",
-    qwen: "🧩",
-    siliconflow: "🌊",
-    volcengine: "🌋",
-    zhipu: "🔮",
-    minimax: "🎯",
-    yi: "✨",
-    baichuan: "🏔️",
-    mistral: "🌀",
-    groq: "⚡",
-    xai: "✖",
-    togetherai: "🤝",
-    fireworks: "🎆",
-    openrouter: "🔀",
-    perplexity: "🔍",
-    cohere: "🔷",
-    deepinfra: "🏗️",
-    cerebras: "🧠",
-  };
-  return iconMap[providerId] ?? "⚡";
-}
 
 // ---------------------------------------------------------------------------
 // Phase types
@@ -401,7 +367,7 @@ class ProviderCommandUI implements Component, Focusable {
     // Select existing provider — go to API key input
     this.selectedProviderId = item.value;
     this.selectedProviderName = item.label;
-    const provider = loadConfig().providers[item.value];
+    const provider = (loadConfig().providers as Record<string, ProviderConfig>)[item.value];
     if (provider) {
       this.selectedBaseUrl = provider.base_url;
       this.selectedType = provider.type;
@@ -641,7 +607,7 @@ class ProviderCommandUI implements Component, Focusable {
   handleInput(data: string): void {
     // Global: delete confirmation in manager
     if (this.deleteTarget !== null) {
-      if (matchesKey(data, Key.y)) {
+      if (data === "y" || data === "Y") {
         removeProvider(this.deleteTarget);
         this.ctx.addSystemMessage(`${YELLOW}Provider "${this.deleteTarget}" removed.${RESET}`);
         this.deleteTarget = null;

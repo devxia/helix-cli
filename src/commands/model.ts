@@ -10,6 +10,7 @@ import {
   fuzzyFilter,
 } from "@earendil-works/pi-tui";
 import {
+  type ProviderConfig,
   type ModelDef,
   getActiveModel,
   getAvailableModels,
@@ -19,6 +20,7 @@ import {
   setActiveModel,
   setThinkingEnabled,
 } from "../config.js";
+import { providerIcon } from "../utils/icons.js";
 import type { CommandContext } from "./index.js";
 
 // ---------------------------------------------------------------------------
@@ -43,42 +45,6 @@ const selectTheme: SelectListTheme = {
 const selectLayout: SelectListLayoutOptions = {
   maxPrimaryColumnWidth: 24,
 };
-
-// ---------------------------------------------------------------------------
-// Provider icon helper
-// ---------------------------------------------------------------------------
-
-function providerIcon(providerId: string): string {
-  const iconMap: Record<string, string> = {
-    kimi: "🌙",
-    "kimi-code": "💻",
-    "moonshot-cn": "🌙",
-    "moonshot-ai": "🌙",
-    openai: "⚡",
-    anthropic: "◈",
-    "google-genai": "🔷",
-    vertexai: "🔷",
-    deepseek: "🔮",
-    qwen: "🧩",
-    siliconflow: "🌊",
-    volcengine: "🌋",
-    zhipu: "🔮",
-    minimax: "🎯",
-    yi: "✨",
-    baichuan: "🏔️",
-    mistral: "🌀",
-    groq: "⚡",
-    xai: "✖",
-    togetherai: "🤝",
-    fireworks: "🎆",
-    openrouter: "🔀",
-    perplexity: "🔍",
-    cohere: "🔷",
-    deepinfra: "🏗️",
-    cerebras: "🧠",
-  };
-  return iconMap[providerId] ?? "⚡";
-}
 
 // ---------------------------------------------------------------------------
 // Model choice with provider grouping
@@ -135,7 +101,7 @@ class TabbedModelSelector implements Component, Focusable {
     const providers = config.providers;
     const choices: ModelChoice[] = [];
 
-    for (const [pid, pconfig] of Object.entries(providers)) {
+    for (const [pid, pconfig] of Object.entries(providers as Record<string, ProviderConfig>)) {
       // Skip providers without API keys
       if (!hasApiKey(pid, pconfig)) continue;
 
@@ -247,7 +213,7 @@ class TabbedModelSelector implements Component, Focusable {
   render(width: number): string[] {
     const lines: string[] = [];
     const config = loadConfig();
-    const activeProvider = config.providers[config.active_provider];
+    const activeProvider = (config.providers as Record<string, ProviderConfig>)[config.active_provider];
     const currentModel = getActiveModel();
 
     // ── Header bar ──────────────────────────────────────────────
