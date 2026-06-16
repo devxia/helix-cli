@@ -33,11 +33,6 @@ export class HelixApp {
         return { consume: true };
       }
 
-      if (matchesKey(data, "ctrl+t")) {
-        this.chat.toggleThinking();
-        return { consume: true };
-      }
-
       if (matchesKey(data, "ctrl+c")) {
         if (this.chat.handleInterrupt()) {
           return { consume: true };

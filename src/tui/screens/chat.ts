@@ -22,7 +22,6 @@ import {
   resolveApiKey,
   resolveBaseUrl,
   setProviderModels,
-  setThinkingEnabled,
 } from "../../config.js";
 import { type CommandContext, registry } from "../../commands/index.js";
 import { executeProviderCommand } from "../../commands/provider.js";
@@ -247,13 +246,6 @@ export class ChatScreen implements Component, Focusable {
 
   toggleHelpOverlay(): void {
     this.showHelpOverlay = !this.showHelpOverlay;
-    this.tui.requestRender(true);
-  }
-
-  toggleThinking(): void {
-    const next = !this.thinkingEnabled();
-    setThinkingEnabled(next);
-    this.status = `Thinking ${next ? "ON" : "OFF"}`;
     this.tui.requestRender(true);
   }
 
@@ -494,7 +486,6 @@ export class ChatScreen implements Component, Focusable {
     add(`${CYAN}Esc${RESET}        Interrupt streaming / exit confirmation`);
     add(`${CYAN}Ctrl+L${RESET}     Clear chat`);
     add(`${CYAN}Ctrl+/${RESET}     Toggle this help overlay`);
-    add(`${CYAN}Ctrl+T${RESET}     Toggle thinking mode`);
     add("");
     add(`${BOLD}Slash commands${RESET}`);
     add("");
