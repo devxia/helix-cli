@@ -17,7 +17,9 @@ import {
   hasApiKey,
   isThinkingEnabled,
   loadConfig,
+  refreshProviderModels,
   setActiveModel,
+  setProviderModels,
   setThinkingEnabled,
 } from "../config.js";
 import { providerIcon } from "../utils/icons.js";
@@ -67,8 +69,8 @@ interface ModelChoice {
 class TabbedModelSelector implements Component, Focusable {
   focused = false;
 
-  private readonly allChoices: ModelChoice[];
-  private readonly tabs: { id: string; label: string; icon: string; choices: ModelChoice[] }[];
+  private allChoices: ModelChoice[];
+  private tabs: { id: string; label: string; icon: string; choices: ModelChoice[] }[];
   private activeTabIndex = 0;
   private searchQuery = "";
   private thinkingDraft: boolean;
@@ -94,6 +96,32 @@ class TabbedModelSelector implements Component, Focusable {
     if (activeProviderIdx >= 0) this.activeTabIndex = activeProviderIdx;
 
     this.activeList = this.buildListForTab(this.activeTabIndex, "");
+
+    // Refresh model lists in the background so new models appear automatically
+    void this.refreshModelsInBackground();
+  }
+
+  private async refreshModelsInBackground(): Promise<void> {
+    const config = loadConfig();
+    const providerIds = Object.entries(config.providers as Record<string, ProviderConfig>)
+      .filter(([pid, pconfig]) => hasApiKey(pid, pconfig))
+      .map(([pid]) => pid);
+
+    for (const pid of providerIds) {
+      try {
+        const models = await refreshProviderModels(pid);
+        if (models.length > 0) {
+          setProviderModels(pid, models);
+        }
+      } catch {
+        // Ignore individual provider refresh failures
+      }
+    }
+
+    this.allChoices = this.buildAllChoices();
+    this.tabs = this.buildTabs(this.allChoices);
+    this.rebuildList();
+    this.ctx.showComponent(this);
   }
 
   private buildAllChoices(): ModelChoice[] {
