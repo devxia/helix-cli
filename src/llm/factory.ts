@@ -16,7 +16,7 @@ export function createLLMProvider(
   switch (provider.type) {
     case "anthropic": {
       const client = new Anthropic({
-        apiKey: apiKey || "unset",
+        apiKey: apiKey || "",
         baseURL: baseURL || undefined,
       });
       return new AnthropicAdapter(client);
@@ -24,7 +24,7 @@ export function createLLMProvider(
     case "google-genai":
     case "vertexai": {
       const client = new GoogleGenAI({
-        apiKey: apiKey || "unset",
+        apiKey: apiKey || "",
         ...(provider.type === "vertexai" && {
           vertexai: true,
           project: process.env.GOOGLE_VERTEX_PROJECT,
@@ -38,7 +38,7 @@ export function createLLMProvider(
     case "openai_responses":
     default: {
       const client = new OpenAI({
-        apiKey: apiKey || "unset",
+        apiKey: apiKey || "",
         baseURL,
         defaultHeaders: { "User-Agent": resolveUserAgent(providerId) },
       });

@@ -139,11 +139,9 @@ export class OpenAIAdapter implements LLMProvider {
         case "user":
           return {
             role: "user",
-            content: m.content.map((part) => {
-              if (part.type === "text") return { type: "text", text: part.text };
-              // v1: drop think parts in user messages; OpenAI does not support them.
-              return { type: "text", text: "" };
-            }),
+            content: m.content
+              .filter((p): p is { type: "text"; text: string } => p.type === "text")
+              .map((p) => ({ type: "text" as const, text: p.text })),
           };
         case "assistant":
           return {

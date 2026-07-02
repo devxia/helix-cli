@@ -147,14 +147,41 @@ export class AnthropicAdapter implements LLMProvider {
             .map((p) => p.text)
             .join(""),
         };
-      case "assistant":
+      case "assistant": {
+        const textContent = message.content
+          .filter((p): p is { type: "text"; text: string } => p.type === "text")
+          .map((p) => p.text)
+          .join("");
+
+        // Preserve tool_use blocks from previous turns so the Anthropic API
+        // can maintain tool-call context across multi-turn conversations.
+        if (message.tool_calls && message.tool_calls.length > 0) {
+          const blocks: Anthropic.Messages.ContentBlockParam[] = [];
+          if (textContent) {
+            blocks.push({ type: "text", text: textContent });
+          }
+          for (const tc of message.tool_calls) {
+            let input: unknown = {};
+            try {
+              input = JSON.parse(tc.function.arguments);
+            } catch {
+              // Use empty object if arguments are not valid JSON.
+            }
+            blocks.push({
+              type: "tool_use",
+              id: tc.id,
+              name: tc.function.name,
+              input,
+            });
+          }
+          return { role: "assistant", content: blocks };
+        }
+
         return {
           role: "assistant",
-          content: message.content
-            .filter((p): p is { type: "text"; text: string } => p.type === "text")
-            .map((p) => p.text)
-            .join(""),
+          content: textContent,
         };
+      }
       case "tool":
         return {
           role: "user",
