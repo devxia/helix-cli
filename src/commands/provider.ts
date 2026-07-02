@@ -392,7 +392,12 @@ class ProviderCommandUI implements Component, Focusable {
     const existing = loadConfig().providers[this.selectedProviderId];
     if (existing) {
       setProvider(this.selectedProviderId, apiKey);
+      // setProvider only touches config; persist models separately.
+      if (this.selectedModels.length > 0) {
+        setProviderModels(this.selectedProviderId, this.selectedModels);
+      }
     } else {
+      // addCustomProvider already persists models when provided.
       addCustomProvider(
         this.selectedProviderId,
         this.selectedProviderName,
@@ -401,10 +406,6 @@ class ProviderCommandUI implements Component, Focusable {
         apiKey,
         this.selectedModels.length > 0 ? this.selectedModels : undefined,
       );
-    }
-
-    if (this.selectedModels.length > 0) {
-      setProviderModels(this.selectedProviderId, this.selectedModels);
     }
 
     this.ctx.addSystemMessage(

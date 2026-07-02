@@ -35,6 +35,8 @@ export class GoogleGenAIAdapter implements LLMProvider {
     const toolBuffers = new Map<string, { id: string; name: string; arguments: string }>();
 
     try {
+      // TODO: @google/genai v2.8.0 does not expose a per-request AbortSignal;
+      // once the SDK supports it, thread request.signal through here.
       const stream = await this.client.models.generateContentStream({
         model: options.model,
         contents,

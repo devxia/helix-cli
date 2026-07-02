@@ -17,6 +17,7 @@ import {
   hasApiKey,
   isThinkingEnabled,
   loadConfig,
+  saveConfig,
   refreshProviderModels,
   setActiveModel,
   setProviderModels,
@@ -201,14 +202,17 @@ class TabbedModelSelector implements Component, Focusable {
     const list = new SelectList(items, 12, selectTheme, selectLayout);
     list.onSelect = (item) => {
       if (item.value === "__none__") return;
-      setActiveModel(item.value);
+      const cfg = loadConfig();
+      cfg.active_model = item.value;
       const choice = tab.choices.find((c) => c.id === item.value);
       if (choice?.reasoning) {
-        setThinkingEnabled(this.thinkingDraft);
+        cfg.thinking = this.thinkingDraft;
+        saveConfig(cfg);
         this.ctx.addSystemMessage(
           `${GREEN}Model set to ${item.label} (thinking ${this.thinkingDraft ? "ON" : "OFF"}).${RESET}`,
         );
       } else {
+        saveConfig(cfg);
         this.ctx.addSystemMessage(
           `${GREEN}Model set to ${item.label}.${RESET}`,
         );
@@ -223,6 +227,11 @@ class TabbedModelSelector implements Component, Focusable {
   }
 
   private rebuildList(): void {
+    // Detach old list callbacks before replacing to prevent leaks.
+    if (this.activeList) {
+      this.activeList.onSelect = undefined;
+      this.activeList.onCancel = undefined;
+    }
     this.activeList = this.buildListForTab(this.activeTabIndex, this.searchQuery);
   }
 

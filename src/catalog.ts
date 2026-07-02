@@ -168,8 +168,10 @@ function loadCacheFromDisk(): { data: Catalog; timestamp: number } | null {
 
 function saveCacheToDisk(data: Catalog): void {
   ensureConfigDir();
+  const file = cachePath();
   const payload = JSON.stringify({ data, timestamp: Date.now() });
-  fs.writeFileSync(cachePath(), payload, "utf-8");
+  fs.writeFileSync(file, payload, "utf-8");
+  fs.chmodSync(file, 0o600);
 }
 
 /**
