@@ -9,6 +9,7 @@ export class GoogleGenAIAdapter implements LLMProvider {
     messages: LLMMessage[];
     tools?: LLMTool[];
     options: LLMOptions;
+    signal?: AbortSignal;
   }): AsyncIterable<LLMEvent> {
     const { messages, tools, options } = request;
     const { systemInstruction, contents } = this.toGenaiContents(messages);
@@ -22,15 +23,13 @@ export class GoogleGenAIAdapter implements LLMProvider {
       config.thinkingConfig = { includeThoughts: true };
     }
     if (tools && tools.length > 0) {
-      config.tools = tools.map((t) => ({
-        functionDeclarations: [
-          {
-            name: t.function.name,
-            description: t.function.description,
-            parameters: t.function.parameters,
-          },
-        ],
-      }));
+      config.tools = [{
+        functionDeclarations: tools.map((t) => ({
+          name: t.function.name,
+          description: t.function.description,
+          parameters: t.function.parameters,
+        })),
+      }];
     }
 
     const toolBuffers = new Map<string, { id: string; name: string; arguments: string }>();
@@ -92,10 +91,20 @@ export class GoogleGenAIAdapter implements LLMProvider {
       const id = fc.id ?? `${fc.name}-${Date.now()}`;
       const args = fc.args ? JSON.stringify(fc.args) : "";
       toolBuffers.set(id, { id, name: fc.name ?? "", arguments: args });
+      // Google GenAI SDK delivers the complete function call in one part, but we
+      // still emit the standard tool_call + tool_call_part sequence so consumers
+      // can treat all adapters uniformly.
       yield {
         type: "tool_call",
-        tool_call: { type: "function", id, function: { name: fc.name ?? "", arguments: args } },
+        tool_call: { type: "function", id, function: { name: fc.name ?? "", arguments: "" } },
       };
+      if (args) {
+        yield {
+          type: "tool_call_part",
+          tool_call_id: id,
+          arguments_part: args,
+        };
+      }
     }
   }
 

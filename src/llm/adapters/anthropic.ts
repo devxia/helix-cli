@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { LLMEvent, LLMMessage, LLMOptions, LLMTool } from "../types.js";
 import type { LLMProvider } from "../provider.js";
 
-const DEFAULT_THINKING_BUDGET = 1024;
+const DEFAULT_THINKING_BUDGET = 10000;
 const DEFAULT_MAX_TOKENS = 4096;
 
 export class AnthropicAdapter implements LLMProvider {
@@ -12,6 +12,7 @@ export class AnthropicAdapter implements LLMProvider {
     messages: LLMMessage[];
     tools?: LLMTool[];
     options: LLMOptions;
+    signal?: AbortSignal;
   }): AsyncIterable<LLMEvent> {
     const { messages, tools, options } = request;
 
@@ -45,7 +46,9 @@ export class AnthropicAdapter implements LLMProvider {
     }
 
     try {
-      const stream = await this.client.messages.create(body as Anthropic.MessageCreateParamsStreaming);
+      const stream = await this.client.messages.create(body as Anthropic.MessageCreateParamsStreaming, {
+        signal: request.signal,
+      });
 
       const toolBuffers = new Map<number, { id: string; name: string; arguments: string }>();
 
@@ -92,8 +95,8 @@ export class AnthropicAdapter implements LLMProvider {
                 usage: {
                   input: event.usage.input_tokens ?? 0,
                   output: event.usage.output_tokens ?? 0,
-                  cacheRead: event.usage.cache_creation_input_tokens ?? undefined,
-                  cacheCreation: event.usage.cache_read_input_tokens ?? undefined,
+                  cacheRead: event.usage.cache_read_input_tokens ?? undefined,
+                  cacheCreation: event.usage.cache_creation_input_tokens ?? undefined,
                 },
               };
             }

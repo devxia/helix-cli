@@ -26,6 +26,7 @@ export class OpenAIAdapter implements LLMProvider {
     messages: LLMMessage[];
     tools?: LLMTool[];
     options: LLMOptions;
+    signal?: AbortSignal;
   }): AsyncIterable<LLMEvent> {
     const { messages, tools, options } = request;
 
@@ -59,6 +60,7 @@ export class OpenAIAdapter implements LLMProvider {
 
     try {
       const stream = await this.client.chat.completions.create(body, {
+        signal: request.signal,
         headers,
       });
 

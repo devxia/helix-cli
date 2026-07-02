@@ -12,5 +12,6 @@ export interface LLMProvider {
     messages: LLMMessage[];
     tools?: LLMTool[];
     options: LLMOptions;
+    signal?: AbortSignal;
   }): AsyncIterable<LLMEvent>;
 }

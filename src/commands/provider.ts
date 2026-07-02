@@ -35,21 +35,8 @@ import {
   catalogModels,
 } from "../catalog.js";
 import { providerIcon } from "../utils/icons.js";
+import { RESET, BOLD, DIM, CYAN, GREEN, YELLOW, RED, BLUE, MAGENTA } from "../utils/ansi.js";
 import type { CommandContext } from "./index.js";
-
-// ---------------------------------------------------------------------------
-// Theme & ANSI
-// ---------------------------------------------------------------------------
-
-const RESET = "\x1b[0m";
-const BOLD = "\x1b[1m";
-const DIM = "\x1b[2m";
-const CYAN = "\x1b[36m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
-const RED = "\x1b[31m";
-const BLUE = "\x1b[34m";
-const MAGENTA = "\x1b[35m";
 
 const selectTheme: SelectListTheme = {
   selectedPrefix: (text) => `${CYAN}${text}${RESET}`,
