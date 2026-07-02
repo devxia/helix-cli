@@ -7,12 +7,13 @@ import {
   DEFAULT_PROVIDERS,
   ENV_API_KEY_MAP,
   ENV_BASE_URL_MAP,
+  ENV_MODEL_MAP,
   type ProviderDef,
 } from "./config/providers.js";
 
 // Re-export for consumers that import from config.js
 export type { ProviderDef } from "./config/providers.js";
-export { FALLBACK_MODELS, DEFAULT_PROVIDERS, ENV_API_KEY_MAP, ENV_BASE_URL_MAP } from "./config/providers.js";
+export { FALLBACK_MODELS, DEFAULT_PROVIDERS, ENV_API_KEY_MAP, ENV_BASE_URL_MAP, ENV_MODEL_MAP } from "./config/providers.js";
 
 // ---------------------------------------------------------------------------
 // Provider type
@@ -87,12 +88,13 @@ function saveModelsToDisk(cache: Map<string, ModelDef[]>): void {
   for (const [id, models] of cache) {
     sections.push(`\n[${id}]\nmodels = [`);
     for (const m of models) {
-      const desc = m.description ? `, description = "${m.description.replace(/"/g, '\\"')}"` : "";
-      sections.push(`  { id = "${m.id}", label = "${m.label}"${desc} },`);
+      const desc = m.description ? `, description = "${tomlEscape(m.description)}"` : "";
+      sections.push(`  { id = "${tomlEscape(m.id)}", label = "${tomlEscape(m.label)}"${desc} },`);
     }
     sections.push("]");
   }
   fs.writeFileSync(modelsCachePath(), sections.join("\n"), "utf-8");
+  fs.chmodSync(modelsCachePath(), 0o600);
 }
 
 /** In-memory cache, lazily loaded from disk on first access. */
@@ -192,7 +194,9 @@ export function loadConfig(): Config {
 export function saveConfig(cfg: Config): void {
   ensureConfigDir();
   const validated = configSchema.parse(cfg);
-  fs.writeFileSync(configPath(), stringifyConfig(validated), "utf-8");
+  const file = configPath();
+  fs.writeFileSync(file, stringifyConfig(validated), "utf-8");
+  fs.chmodSync(file, 0o600);
   _configCache = validated;
 }
 
@@ -218,10 +222,16 @@ export function setProvider(providerId: string, apiKey: string): Config {
     throw new Error(`Unknown provider: ${providerId}`);
   }
   provider.api_key = apiKey;
+
+  const sameProvider = cfg.active_provider === providerId;
   cfg.active_provider = providerId;
-  // Reset model to the provider's first available model when switching
-  const models = getAvailableModels(providerId);
-  cfg.active_model = models[0]?.id ?? providerId;
+
+  if (!sameProvider) {
+    // Reset model to the provider's first available model when switching providers.
+    const models = getAvailableModels(providerId);
+    cfg.active_model = models[0]?.id ?? providerId;
+  }
+
   saveConfig(cfg);
   return cfg;
 }
@@ -265,7 +275,13 @@ export function removeProvider(providerId: string): Config {
   // If deleted was active, switch to first remaining
   if (cfg.active_provider === providerId) {
     const remaining = Object.keys(cfg.providers);
-    cfg.active_provider = remaining[0] ?? "kimi";
+    if (remaining.length > 0) {
+      cfg.active_provider = remaining[0]!;
+    } else {
+      // Fall back to the default kimi provider so the config stays consistent.
+      cfg.providers["kimi"] = { ...DEFAULT_PROVIDERS.kimi! };
+      cfg.active_provider = "kimi";
+    }
     const models = getAvailableModels(cfg.active_provider);
     cfg.active_model = models[0]?.id ?? "";
   }
@@ -333,7 +349,8 @@ export async function refreshProviderModels(providerId: string): Promise<ModelDe
   }
 
   try {
-    const res = await fetch(`${baseUrl}/models`, {
+    const normalized = baseUrl.replace(/\/+$/, "");
+    const res = await fetch(`${normalized}/models`, {
       headers: apiKey
         ? { Authorization: `Bearer ${apiKey}`, "User-Agent": "HelixCLI/1.0" }
         : { "User-Agent": "HelixCLI/1.0" },

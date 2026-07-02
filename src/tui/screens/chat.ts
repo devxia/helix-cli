@@ -22,6 +22,7 @@ import {
   resolveApiKey,
   resolveBaseUrl,
   setProviderModels,
+  ENV_MODEL_MAP,
 } from "../../config.js";
 import { type CommandContext, registry } from "../../commands/index.js";
 import { executeProviderCommand } from "../../commands/provider.js";
@@ -164,16 +165,15 @@ export class ChatScreen implements Component, Focusable {
     const helixModel = process.env.HELIX_MODEL;
     if (helixModel) return helixModel;
 
-    // Per-provider env var fallback
+    // Per-provider env var (e.g. DEEPSEEK_MODEL, OPENAI_MODEL, …)
     const providerId = loadConfig().active_provider;
-    const envModelMap: Record<string, string | undefined> = {
-      openai: process.env.OPENAI_MODEL,
-      anthropic: process.env.ANTHROPIC_MODEL,
-      "google-genai": process.env.GOOGLE_MODEL,
-      vertexai: process.env.GOOGLE_MODEL,
-      kimi: process.env.KIMI_MODEL,
-    };
-    return envModelMap[providerId] || getActiveModel();
+    const envVar = ENV_MODEL_MAP[providerId];
+    if (envVar) {
+      const envValue = process.env[envVar];
+      if (envValue) return envValue;
+    }
+
+    return getActiveModel();
   }
 
   private resolveProvider() {
