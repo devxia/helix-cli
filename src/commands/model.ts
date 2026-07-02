@@ -23,18 +23,8 @@ import {
   setThinkingEnabled,
 } from "../config.js";
 import { providerIcon } from "../utils/icons.js";
+import { RESET, BOLD, DIM, CYAN, GREEN, BLUE } from "../utils/ansi.js";
 import type { CommandContext } from "./index.js";
-
-// ---------------------------------------------------------------------------
-// Theme & ANSI
-// ---------------------------------------------------------------------------
-
-const RESET = "\x1b[0m";
-const BOLD = "\x1b[1m";
-const DIM = "\x1b[2m";
-const CYAN = "\x1b[36m";
-const GREEN = "\x1b[32m";
-const BLUE = "\x1b[34m";
 
 const selectTheme: SelectListTheme = {
   selectedPrefix: (text) => `${CYAN}${text}${RESET}`,

@@ -31,6 +31,7 @@ import { createLLMProvider } from "../../llm/factory.js";
 import type { LLMProvider } from "../../llm/provider.js";
 import type { LLMEvent } from "../../llm/types.js";
 import { providerIcon } from "../../utils/icons.js";
+import { RESET, DIM, BOLD, CYAN, GREEN, RED, YELLOW } from "../../utils/ansi.js";
 
 type ChatMessage = {
   role: "user" | "assistant" | "system";
@@ -38,14 +39,6 @@ type ChatMessage = {
   thinking?: string;
   thinkingExpanded?: boolean;
 };
-
-const RESET = "\x1b[0m";
-const DIM = "\x1b[2m";
-const BOLD = "\x1b[1m";
-const CYAN = "\x1b[36m";
-const GREEN = "\x1b[32m";
-const RED = "\x1b[31m";
-const YELLOW = "\x1b[33m";
 
 const editorTheme: EditorTheme = {
   borderColor: (text) => `${CYAN}${text}${RESET}`,
@@ -64,7 +57,6 @@ export class ChatScreen implements Component, Focusable {
   private readonly editor: Editor;
   private provider: LLMProvider;
   private model: string;
-  private readonly conversation: Array<{ role: "user" | "assistant"; content: string }> = [];
   private messages: ChatMessage[] = [
     {
       role: "system",
@@ -152,6 +144,10 @@ export class ChatScreen implements Component, Focusable {
 
 
 
+  isStreaming(): boolean {
+    return this.activeRequest !== null;
+  }
+
   private createProvider(): LLMProvider {
     const provider = getActiveProvider();
     const providerId = loadConfig().active_provider;
@@ -164,9 +160,11 @@ export class ChatScreen implements Component, Focusable {
   }
 
   private resolveModel(): string {
-    const envModel = process.env.KIMI_MODEL;
-    if (envModel) return envModel;
+    // Generic override applies to any provider
+    const helixModel = process.env.HELIX_MODEL;
+    if (helixModel) return helixModel;
 
+    // Per-provider env var fallback
     const providerId = loadConfig().active_provider;
     const envModelMap: Record<string, string | undefined> = {
       openai: process.env.OPENAI_MODEL,
@@ -239,7 +237,6 @@ export class ChatScreen implements Component, Focusable {
   clearChat(): void {
     // Keep only the initial system welcome message(s)
     this.messages = this.messages.filter((m) => m.role === "system");
-    this.conversation.length = 0;
     this.status = "Chat cleared";
     this.tui.requestRender(true);
   }
@@ -261,8 +258,9 @@ export class ChatScreen implements Component, Focusable {
       this.status = "Idle";
     }
 
-    // Toggle thinking expansion for the last assistant message
-    if (data === "t" && !this.commandComponent && !this.activeRequest) {
+    // Toggle thinking expansion for the last assistant message when the editor is empty.
+    // Otherwise the "t" keystroke should go into the input.
+    if (data === "t" && !this.commandComponent && !this.activeRequest && this.editor.getText().trim() === "") {
       this.toggleLastThinkingExpansion();
       return;
     }
@@ -383,7 +381,6 @@ export class ChatScreen implements Component, Focusable {
     this.inputHistory.unshift(input);
     this.inputHistoryIndex = -1;
     this.editor.setText("");
-    this.conversation.push({ role: "user", content: input });
     this.messages.push({ role: "user", content: input });
     this.messages.push({ role: "assistant", content: "" });
     this.status = "Streaming...";
@@ -398,11 +395,12 @@ export class ChatScreen implements Component, Focusable {
 
     try {
       const stream = this.provider.stream({
-        messages: this.toLLMMessages(this.conversation),
+        messages: this.toLLMMessages(),
         options: {
           model: this.model,
           thinking: this.currentModelSupportsThinking() && this.thinkingEnabled(),
         },
+        signal: controller.signal,
       });
 
       for await (const event of stream) {
@@ -433,7 +431,6 @@ export class ChatScreen implements Component, Focusable {
       }
 
       if (!controller.signal.aborted) {
-        this.conversation.push({ role: "assistant", content: reply });
         this.status = "Idle";
       }
     } catch (err) {
@@ -458,13 +455,16 @@ export class ChatScreen implements Component, Focusable {
     // Hook for future handling (tool calls, subagent events, etc.)
   }
 
-  private toLLMMessages(
-    conversation: Array<{ role: "user" | "assistant"; content: string }>,
-  ): Array<{ role: "user"; content: [{ type: "text"; text: string }] } | { role: "assistant"; content: [{ type: "text"; text: string }] }> {
-    return conversation.map((m) => ({
-      role: m.role,
-      content: [{ type: "text" as const, text: m.content }],
-    }));
+  private toLLMMessages(): Array<
+    | { role: "user"; content: [{ type: "text"; text: string }] }
+    | { role: "assistant"; content: [{ type: "text"; text: string }] }
+  > {
+    return this.messages
+      .filter((m): m is ChatMessage & { role: "user" | "assistant" } => m.role === "user" || m.role === "assistant")
+      .map((m) => ({
+        role: m.role,
+        content: [{ type: "text" as const, text: m.content }],
+      }));
   }
 
   private updateLastAssistantMessage(content: string, thinking?: string): void {

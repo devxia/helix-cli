@@ -21,14 +21,21 @@ export function createLLMProvider(
       });
       return new AnthropicAdapter(client);
     }
-    case "google-genai": {
-      const client = new GoogleGenAI({ apiKey: apiKey || "unset" });
+    case "google-genai":
+    case "vertexai": {
+      const client = new GoogleGenAI({
+        apiKey: apiKey || "unset",
+        ...(provider.type === "vertexai" && {
+          vertexai: true,
+          project: process.env.GOOGLE_VERTEX_PROJECT,
+          location: process.env.GOOGLE_VERTEX_LOCATION,
+        }),
+      });
       return new GoogleGenAIAdapter(client);
     }
     case "kimi":
     case "openai":
     case "openai_responses":
-    case "vertexai":
     default: {
       const client = new OpenAI({
         apiKey: apiKey || "unset",

@@ -42,7 +42,13 @@ export class HelixApp {
         process.exit(0);
       }
 
-      // Esc is handled by ChatScreen; keep it there so slash commands can use it.
+      if (matchesKey(data, "esc")) {
+        if (this.chat.isStreaming()) {
+          this.chat.handleInterrupt();
+          return { consume: true };
+        }
+        // Otherwise let ChatScreen handle it for slash-command UIs.
+      }
     });
 
     this.tui.start();
