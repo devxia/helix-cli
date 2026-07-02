@@ -16,15 +16,15 @@ Repository-level Agent Guide
 
 ## 技术约束（不可违背）
 
-| 层级 | 技术 | 替换条件 |
-|------|------|---------|
-| 运行时 | Bun 1.2+ | 仅当 Bun 停止维护时可退至 Node.js + tsx |
-| TUI | pi-TUI (`@earendil-works/pi-tui`) | 仅当项目停止维护时可考虑 blessed |
-| Agent | LangGraph TS (`@langchain/langgraph`) | 不接受替换 |
-| LLM SDK | OpenAI SDK (`openai` + base_url) 为主；Anthropic (`@anthropic-ai/sdk`)、Google GenAI (`@google/genai`) 用于原生协议 | 不接受替换 OpenAI SDK 的核心地位；新增原生 SDK 需经 ADR |
-| 数据 | bun:sqlite | 不接受替换 |
-| 验证 | Zod | 不接受替换 |
-| 分发 | `bun build --compile` | 仅当 Bun 取消该功能时可退至 pkg |
+| 层级 | 技术 | 替换条件 | 现状(v1) |
+|------|------|---------|---------|
+| 运行时 | Bun 1.2+ | 仅当 Bun 停止维护时可退至 Node.js + tsx | ✅ 已落地 |
+| TUI | pi-TUI (`@earendil-works/pi-tui`) | 仅当项目停止维护时可考虑 blessed | ✅ 已落地 |
+| Agent | LangGraph TS (`@langchain/langgraph`) | 不接受替换 | ⏳ 未引入 |
+| LLM SDK | OpenAI SDK (`openai` + base_url) 为主；Anthropic (`@anthropic-ai/sdk`)、Google GenAI (`@google/genai`) 用于原生协议 | 不接受替换 OpenAI SDK 的核心地位；新增原生 SDK 需经 ADR | ✅ 已落地 |
+| 数据 | bun:sqlite | 不接受替换 | ⏳ 未引入（暂用 `Bun.TOML` 读配置） |
+| 验证 | Zod | 不接受替换 | ✅ 已落地 |
+| 分发 | `bun build --compile` | 仅当 Bun 取消该功能时可退至 pkg | ✅ 已落地 |
 
 **不在技术栈列表上的依赖不引入。** 不引入 PostgreSQL、Redis、Docker、FastAPI、Express、React（Web）、MCP Server 架构。Helix Cli 是单进程终端应用，不是分布式系统。
 
@@ -100,13 +100,67 @@ src/
 
 ---
 
+## 现状(v1)
+
+> 上方「项目地图」是完整愿景。当前 `src/` 只实现了聊天客户端层；Agent、工具、子进程、bun:sqlite 均未引入。以下为代码真相，修改以本节为准。
+
+### 已实现文件
+
+```
+src/
+  main.ts              — 入口。解析 --version，启动 HelixApp。
+  config.ts            — Zod 配置模型 + ~/.helix/config.toml 持久化，
+                         模型缓存（~/.helix/models_cache.toml），从 /v1/models 拉模型列表。
+  catalog.ts           — 从 models.dev/api.json 拉 provider 目录，磁盘缓存。
+  commands/
+    index.ts           — CommandRegistry 单例 + CommandContext + SlashCommandDef。
+    provider.ts        — /provider 斜杠命令（选 provider → 输 API key）。
+    model.ts           — /model 斜杠命令（选模型 + thinking 开关）。
+  llm/
+    types.ts           — 统一 LLM 类型（LLMMessage / LLMEvent / LLMToolCall）。
+    provider.ts        — LLMProvider 接口（只有 stream() 一个方法）。
+    factory.ts         — 按 provider.type 创建适配器。
+    adapters/
+      openai.ts        — OpenAI Chat Completions + reasoning_content。
+      anthropic.ts     — Anthropic Messages。
+      google-genai.ts  — Google GenAI。
+  tui/
+    app.ts             — HelixApp：全局快捷键（Ctrl+L / Ctrl+/ / Ctrl+C）。
+    screens/
+      chat.ts          — ChatScreen：唯一常驻界面。编辑器 + 流式聊天 +
+                         reasoning 展示 + 斜杠命令路由 + 自动补全。
+  utils/
+    icons.ts           — provider 图标。
+```
+
+### 命令
+
+```bash
+bun --hot src/main.ts                             # 开发热重载
+bun build --compile --outfile helix src/main.ts   # 编译单二进制（~70MB）
+./helix                                           # 运行
+bunx tsc --noEmit                                 # 类型检查
+```
+
+无测试套件、无 linter。
+
+### 关键模式
+
+**斜杠命令。** 命令通过 `registry.register({name, description, execute})` 注册。`execute` 回调收到 `CommandContext`，可替换编辑器显示内联 UI、加系统消息、触发 provider/model 刷新。自动补全经 pi-TUI 的 `CombinedAutocompleteProvider` 接入。
+
+**配置流。** `loadConfig()` 读 `~/.helix/config.toml` → Zod 解析 → 类型化 Config。`saveConfig()` 校验后写 TOML。Provider/model 变更即时持久化。环境变量（如 `KIMI_API_KEY`、`KIMI_BASE_URL`、`KIMI_MODEL`）在运行时覆盖配置值。
+
+**多协议流式聊天。** `ChatScreen` 通过 `createLLMProvider()` 拿到 `LLMProvider`，调 `stream()` 得 `AsyncIterable<LLMEvent>`。适配器把各家协议映射成统一事件流（`content` / `tool_call` / `status` / `error` / `done`）。中断用 `AbortController`——首次 Ctrl+C 中断流，第二次退出。
+
+**ANSI 渲染。** pi-TUI 期望字符串内嵌原始 ANSI 转义。颜色常量（`DIM`、`CYAN`、`GREEN`、`RED`、`YELLOW`）在各渲染文件内定义。辅助函数：`truncateToWidth`、`visibleWidth`、`wrapTextWithAnsi`。
+
+---
+
 ## 工作流要求
 
 **提交规范。** 提交信息遵循 `<type>(<scope>): <subject>`。类型：`feat`, `fix`, `docs`, `refactor`, `test`, `chore`。Scope 是修改的目录或模块。Subject 用英文祈使句（"add" not "added"）。
 
 **阶段门控。** 每个开发阶段在 `HelixCli_vibecoding_prompt.txt` 中有验收标准。完成一个阶段后，运行全部验收检查，全部通过后才能标记阶段完成并进入下一阶段。
-
-**不暴露 Agent 身份。** 提交信息、PR 描述、代码注释中不提及 Agent 或 AI 辅助。提交的代码与人类开发者提交的代码无异。
 
 ---
 
