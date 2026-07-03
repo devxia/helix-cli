@@ -18,9 +18,14 @@ export class AnthropicAdapter implements LLMProvider {
 
     const { system, anthropicMessages } = this.splitSystem(messages);
 
+    let maxTokens = options.max_tokens ?? DEFAULT_MAX_TOKENS;
+    if (options.thinking) {
+      maxTokens = Math.max(maxTokens, DEFAULT_THINKING_BUDGET + 1);
+    }
+
     const body: Anthropic.MessageCreateParams = {
       model: options.model,
-      max_tokens: options.max_tokens ?? DEFAULT_MAX_TOKENS,
+      max_tokens: maxTokens,
       messages: anthropicMessages,
       stream: true,
     };

@@ -76,6 +76,7 @@ function loadModelsFromDisk(): Map<string, ModelDef[]> {
         id: String(m.id ?? ""),
         label: String(m.label ?? m.id ?? ""),
         description: m.description ? String(m.description) : undefined,
+        reasoning: m.reasoning === true ? true : undefined,
       })));
     }
   } catch { /* corrupt → ignore */ }
@@ -89,7 +90,8 @@ function saveModelsToDisk(cache: Map<string, ModelDef[]>): void {
     sections.push(`\n[${id}]\nmodels = [`);
     for (const m of models) {
       const desc = m.description ? `, description = "${tomlEscape(m.description)}"` : "";
-      sections.push(`  { id = "${tomlEscape(m.id)}", label = "${tomlEscape(m.label)}"${desc} },`);
+      const reasoning = m.reasoning === true ? ", reasoning = true" : "";
+      sections.push(`  { id = "${tomlEscape(m.id)}", label = "${tomlEscape(m.label)}"${desc}${reasoning} },`);
     }
     sections.push("]");
   }
@@ -185,7 +187,10 @@ export function loadConfig(): Config {
     const parsed = Bun.TOML.parse(raw);
     _configCache = configSchema.parse(parsed);
     return _configCache;
-  } catch {
+  } catch (err) {
+    console.error(
+      `Warning: failed to parse config at ${file}. Falling back to defaults. Error: ${err instanceof Error ? err.message : String(err)}`,
+    );
     _configCache = defaultConfig();
     return _configCache;
   }
@@ -362,9 +367,25 @@ export async function refreshProviderModels(providerId: string): Promise<ModelDe
     const body = (await res.json()) as { data?: Array<{ id: string }> };
     if (!Array.isArray(body.data)) throw new Error("Unexpected response shape");
 
+    const metadata = new Map<string, ModelDef>();
+    for (const m of modelCache().get(providerId) ?? []) {
+      metadata.set(m.id, m);
+    }
+    for (const m of FALLBACK_MODELS[providerId] ?? []) {
+      if (!metadata.has(m.id)) metadata.set(m.id, m);
+    }
+
     const models: ModelDef[] = body.data
       .filter((m) => m.id && typeof m.id === "string")
-      .map((m) => ({ id: m.id, label: m.id }));
+      .map((m) => {
+        const existing = metadata.get(m.id);
+        return {
+          id: m.id,
+          label: existing?.label ?? m.id,
+          description: existing?.description,
+          reasoning: existing?.reasoning,
+        };
+      });
 
     if (models.length === 0) throw new Error("Empty model list");
 
