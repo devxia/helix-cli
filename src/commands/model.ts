@@ -353,20 +353,22 @@ class TabbedModelSelector implements Component, Focusable {
   }
 
   handleInput(data: string): void {
-    // Tab / Shift+Tab — cycle tabs
-    if (matchesKey(data, Key.tab)) {
-      this.activeTabIndex = (this.activeTabIndex + 1) % this.tabs.length;
-      this.searchQuery = "";
-      this.rebuildList();
-      this.ctx.showComponent(this);
-      return;
-    }
-    if (matchesKey(data, Key.shift(Key.tab))) {
-      this.activeTabIndex = (this.activeTabIndex - 1 + this.tabs.length) % this.tabs.length;
-      this.searchQuery = "";
-      this.rebuildList();
-      this.ctx.showComponent(this);
-      return;
+    // Tab / Shift+Tab — cycle tabs (guard against empty tabs to avoid modulo-by-zero → NaN)
+    if (this.tabs.length > 0) {
+      if (matchesKey(data, Key.tab)) {
+        this.activeTabIndex = (this.activeTabIndex + 1) % this.tabs.length;
+        this.searchQuery = "";
+        this.rebuildList();
+        this.ctx.showComponent(this);
+        return;
+      }
+      if (matchesKey(data, Key.shift(Key.tab))) {
+        this.activeTabIndex = (this.activeTabIndex - 1 + this.tabs.length) % this.tabs.length;
+        this.searchQuery = "";
+        this.rebuildList();
+        this.ctx.showComponent(this);
+        return;
+      }
     }
 
     // Left → thinking ON, Right → thinking OFF

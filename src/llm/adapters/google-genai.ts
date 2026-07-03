@@ -116,13 +116,19 @@ export class GoogleGenAIAdapter implements LLMProvider {
   } {
     const systemParts: string[] = [];
     const contents: Content[] = [];
+    const toolNameMap = new Map<string, string>();
 
     for (const m of messages) {
       if (m.role === "system") {
         systemParts.push(m.content);
         continue;
       }
-      contents.push(this.toGenaiContent(m));
+      if (m.role === "assistant" && m.tool_calls) {
+        for (const tc of m.tool_calls) {
+          toolNameMap.set(tc.id, tc.function.name);
+        }
+      }
+      contents.push(this.toGenaiContent(m, toolNameMap));
     }
 
     return {
@@ -131,7 +137,10 @@ export class GoogleGenAIAdapter implements LLMProvider {
     };
   }
 
-  private toGenaiContent(message: LLMMessage): Content {
+  private toGenaiContent(
+    message: LLMMessage,
+    toolNameMap: Map<string, string>,
+  ): Content {
     switch (message.role) {
       case "user":
         return {
@@ -140,13 +149,30 @@ export class GoogleGenAIAdapter implements LLMProvider {
             .filter((p): p is { type: "text"; text: string } => p.type === "text")
             .map((p) => ({ text: p.text })),
         };
-      case "assistant":
-        return {
-          role: "model",
-          parts: message.content
-            .filter((p): p is { type: "text"; text: string } => p.type === "text")
-            .map((p) => ({ text: p.text })),
-        };
+      case "assistant": {
+        const parts: Part[] = message.content
+          .filter((p): p is { type: "text"; text: string } => p.type === "text")
+          .map((p) => ({ text: p.text }));
+
+        if (message.tool_calls) {
+          for (const tc of message.tool_calls) {
+            let args: Record<string, unknown> = {};
+            try {
+              args = JSON.parse(tc.function.arguments);
+            } catch {
+              // Leave args empty if the model emitted invalid JSON.
+            }
+            parts.push({
+              functionCall: {
+                id: tc.id,
+                name: tc.function.name,
+                args,
+              },
+            });
+          }
+        }
+        return { role: "model", parts };
+      }
       case "tool":
         return {
           role: "user",
@@ -154,7 +180,7 @@ export class GoogleGenAIAdapter implements LLMProvider {
             {
               functionResponse: {
                 id: message.tool_call_id,
-                name: "",
+                name: toolNameMap.get(message.tool_call_id) ?? "",
                 response: { result: message.content },
               },
             },

@@ -238,10 +238,13 @@ class ProviderCommandUI implements Component, Focusable {
     this.customKeyInput.onSubmit = (key) => {
       const trimmed = key.trim();
       if (!trimmed) return;
-      const safeId = this.customName
+      let safeId = this.customName
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
         .replace(/^-+|-+$/g, "");
+      if (!safeId) {
+        safeId = `custom-${Date.now()}`;
+      }
       addCustomProvider(safeId, this.customName, this.customType, this.customBaseUrl, trimmed);
       this.ctx.addSystemMessage(
         `${GREEN}Custom provider "${this.customName}" added and activated.${RESET}`,
