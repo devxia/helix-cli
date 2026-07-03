@@ -187,9 +187,9 @@ export function loadConfig(): Config {
     const parsed = Bun.TOML.parse(raw);
     _configCache = configSchema.parse(parsed);
     return _configCache;
-  } catch (err) {
+  } catch {
     console.error(
-      `Warning: failed to parse config at ${file}. Falling back to defaults. Error: ${err instanceof Error ? err.message : String(err)}`,
+      `Warning: failed to parse config at ${file}. Falling back to defaults.`,
     );
     _configCache = defaultConfig();
     return _configCache;
