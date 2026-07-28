@@ -1,53 +1,35 @@
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
-import { GoogleGenAI } from "@google/genai";
-import type { ProviderConfig } from "../config.js";
+import { GoogleGenAI, type GoogleGenAIOptions } from "@google/genai";
+import type { ProviderConfig, ResolvedCredentials } from "../config.js";
 import type { LLMProvider } from "./provider.js";
 import { OpenAIAdapter } from "./adapters/openai.js";
 import { AnthropicAdapter } from "./adapters/anthropic.js";
 import { GoogleGenAIAdapter } from "./adapters/google-genai.js";
 
-export function createLLMProvider(
-  providerId: string,
-  provider: ProviderConfig,
-  apiKey: string,
-  baseURL: string,
-): LLMProvider {
-  switch (provider.type) {
-    case "anthropic": {
-      const client = new Anthropic({
-        apiKey: apiKey || "",
-        baseURL: baseURL || undefined,
-      });
-      return new AnthropicAdapter(client);
-    }
-    case "google-genai":
-    case "vertexai": {
-      const client = new GoogleGenAI({
-        apiKey: apiKey || "",
-        ...(provider.type === "vertexai" && {
-          vertexai: true,
-          project: process.env.GOOGLE_VERTEX_PROJECT,
-          location: process.env.GOOGLE_VERTEX_LOCATION,
-        }),
-      });
-      return new GoogleGenAIAdapter(client);
-    }
-    case "kimi":
-    case "openai":
-    case "openai_responses":
-    default: {
-      const client = new OpenAI({
-        apiKey: apiKey || "",
-        baseURL,
-        defaultHeaders: { "User-Agent": resolveUserAgent(providerId) },
-      });
-      return new OpenAIAdapter(client, resolveUserAgent(providerId));
-    }
+export function googleClientOptions(provider: ProviderConfig, credentials: ResolvedCredentials): GoogleGenAIOptions {
+  if (provider.type === "vertexai") {
+    if (credentials.kind !== "vertex") throw new Error("Vertex requires GOOGLE_VERTEX_PROJECT and GOOGLE_VERTEX_LOCATION");
+    return { vertexai: true, project: credentials.project, location: credentials.location };
   }
+  if (credentials.kind !== "api-key") throw new Error("Google GenAI requires an API key");
+  return { apiKey: credentials.apiKey };
 }
 
-function resolveUserAgent(providerId: string): string {
-  if (providerId === "kimi-code") return "KimiCLI/0.63";
-  return "HelixCLI/1.5";
+export function createLLMProvider(providerId: string, provider: ProviderConfig, credentials: ResolvedCredentials): LLMProvider {
+  switch (provider.type) {
+    case "anthropic": {
+      const apiKey = credentials.kind === "api-key" ? credentials.apiKey : "";
+      return new AnthropicAdapter(new Anthropic({ apiKey, baseURL: provider.base_url || undefined }), providerId);
+    }
+    case "google-genai":
+    case "vertexai":
+      return new GoogleGenAIAdapter(new GoogleGenAI(googleClientOptions(provider, credentials)));
+    case "openai": {
+      const apiKey = credentials.kind === "api-key" ? credentials.apiKey : "";
+      const userAgent = providerId === "kimi-for-coding" ? "KimiCLI/0.63" : "HelixCLI/1.5";
+      const client = new OpenAI({ apiKey, baseURL: provider.base_url, defaultHeaders: { "User-Agent": userAgent } });
+      return new OpenAIAdapter(client, providerId, userAgent);
+    }
+  }
 }
