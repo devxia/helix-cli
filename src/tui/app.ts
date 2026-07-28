@@ -33,6 +33,11 @@ export class HelixApp {
         return { consume: true };
       }
 
+      if (matchesKey(data, "ctrl+t")) {
+        this.chat.toggleLastThinkingExpansion();
+        return { consume: true };
+      }
+
       if (matchesKey(data, "ctrl+c")) {
         if (this.chat.handleInterrupt()) {
           return { consume: true };

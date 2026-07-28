@@ -4,30 +4,31 @@ import {
   type SelectItem,
   SelectList,
   type SelectListTheme,
-  type SelectListLayoutOptions,
   matchesKey,
   Key,
   fuzzyFilter,
+  truncateToWidth,
 } from "@earendil-works/pi-tui";
 import {
-  type ProviderConfig,
   type ModelDef,
-  getActiveModel,
+  type ProviderConfig,
+  type ReasoningCapability,
+  type ThinkingPreference,
+  cycleThinkingState,
   getAvailableModels,
-  hasApiKey,
-  isThinkingEnabled,
+  hasCredentials,
   loadConfig,
-  saveConfig,
   refreshProviderModels,
-  setActiveModel,
-  setProviderModels,
-  setThinkingEnabled,
+  resolveThinkingPreference,
+  setActiveSelection,
+  setThinkingPreference,
+  thinkingStates,
 } from "../config.js";
 import { providerIcon } from "../utils/icons.js";
-import { RESET, BOLD, DIM, CYAN, GREEN, BLUE } from "../utils/ansi.js";
+import { RESET, BOLD, DIM, CYAN, GREEN } from "../utils/ansi.js";
 import type { CommandContext } from "./index.js";
 
-const selectTheme: SelectListTheme = {
+const theme: SelectListTheme = {
   selectedPrefix: (text) => `${CYAN}${text}${RESET}`,
   selectedText: (text) => `${CYAN}${text}${RESET}`,
   description: (text) => `${DIM}${text}${RESET}`,
@@ -35,405 +36,182 @@ const selectTheme: SelectListTheme = {
   noMatch: (text) => `${DIM}${text}${RESET}`,
 };
 
-const selectLayout: SelectListLayoutOptions = {
-  maxPrimaryColumnWidth: 24,
-};
-
-// ---------------------------------------------------------------------------
-// Model choice with provider grouping
-// ---------------------------------------------------------------------------
-
-interface ModelChoice {
-  id: string;
-  label: string;
+export interface ModelChoice {
+  key: string;
   providerId: string;
   providerName: string;
-  description: string;
-  displayLabel: string;
-  reasoning?: boolean;
+  model: ModelDef;
+}
+export interface ModelTab {
+  id: string;
+  label: string;
+  choices: readonly ModelChoice[];
 }
 
-// ---------------------------------------------------------------------------
-// TabbedModelSelector — model picker with visual tabs + search + thinking
-// ---------------------------------------------------------------------------
+export function buildModelChoices(providers: Record<string, ProviderConfig>): ModelChoice[] {
+  const choices: ModelChoice[] = [];
+  for (const [providerId, provider] of Object.entries(providers)) {
+    if (!hasCredentials(provider)) continue;
+    for (const model of getAvailableModels(providerId)) {
+      choices.push({
+        key: `${providerId}\u0000${model.id}`,
+        providerId,
+        providerName: provider.name,
+        model: { ...model, reasoning: { ...model.reasoning, effort: model.reasoning.effort ? [...model.reasoning.effort] : undefined } },
+      });
+    }
+  }
+  return choices;
+}
 
-class TabbedModelSelector implements Component, Focusable {
+export function buildModelTabs(choices: readonly ModelChoice[]): ModelTab[] {
+  const grouped = new Map<string, ModelChoice[]>();
+  for (const choice of choices) {
+    const group = grouped.get(choice.providerId) ?? [];
+    group.push(choice);
+    grouped.set(choice.providerId, group);
+  }
+  const tabs: ModelTab[] = [];
+  if (grouped.size > 1) tabs.push({ id: "__all__", label: "All", choices: [...choices] });
+  for (const [providerId, models] of grouped) {
+    tabs.push({ id: providerId, label: models[0]?.providerName ?? providerId, choices: models });
+  }
+  return tabs;
+}
+
+export function thinkingPreview(capability: ReasoningCapability, current: ThinkingPreference): string {
+  return thinkingStates(capability).map((state) => {
+    const active = state.enabled === current.enabled && state.effort === current.effort;
+    return `${active ? "◉" : "○"} ${state.label}`;
+  }).join(" │ ");
+}
+
+class ModelSelector implements Component, Focusable {
   focused = false;
-
-  private allChoices: ModelChoice[];
-  private tabs: { id: string; label: string; icon: string; choices: ModelChoice[] }[];
+  private readonly choices: readonly ModelChoice[];
+  private readonly tabs: readonly ModelTab[];
   private activeTabIndex = 0;
-  private searchQuery = "";
-  private thinkingDraft: boolean;
-  private activeList: SelectList;
-  /** Track last selected model so we auto-enable thinking on model change. */
-  private lastSelectedModelId = "";
+  private search = "";
+  private list: SelectList;
+  private readonly drafts = new Map<string, ThinkingPreference>();
+  private readonly modified = new Set<string>();
 
-  private readonly ctx: CommandContext;
+  constructor(private readonly ctx: CommandContext) {
+    const snapshot = loadConfig();
+    this.choices = buildModelChoices({ ...snapshot.providers });
+    this.tabs = buildModelTabs(this.choices);
+    const activeProviderTab = this.tabs.findIndex((tab) => tab.id === snapshot.active_provider);
+    if (activeProviderTab >= 0) this.activeTabIndex = activeProviderTab;
+    for (const choice of this.choices) {
+      this.drafts.set(choice.key, resolveThinkingPreference(choice.providerId, choice.model));
+    }
+    this.list = this.buildList();
+    // The selector snapshot never mutates. SWR results appear next invocation.
+    for (const providerId of new Set(this.choices.map((choice) => choice.providerId))) void refreshProviderModels(providerId);
+  }
 
-  constructor(ctx: CommandContext) {
-    this.ctx = ctx;
-    this.thinkingDraft = isThinkingEnabled();
+  private tabChoices(): readonly ModelChoice[] { return this.tabs[this.activeTabIndex]?.choices ?? []; }
+  private filtered(): ModelChoice[] {
+    const choices = [...this.tabChoices()];
+    return this.search ? fuzzyFilter(choices, this.search.toLowerCase(), (choice) => `${choice.model.label} ${choice.model.id} ${choice.providerName}`) : choices;
+  }
 
-    // Collect models ONLY from providers that have API keys
-    this.allChoices = this.buildAllChoices();
-
-    // Build tabs
-    this.tabs = this.buildTabs(this.allChoices);
-
-    // Set initial tab to active provider (if it has a key)
+  private buildList(): SelectList {
     const config = loadConfig();
-    const activeProviderIdx = this.tabs.findIndex((t) => t.id === config.active_provider);
-    if (activeProviderIdx >= 0) this.activeTabIndex = activeProviderIdx;
-
-    this.activeList = this.buildListForTab(this.activeTabIndex, "");
-
-    // Refresh model lists in the background so new models appear automatically
-    void this.refreshModelsInBackground();
-  }
-
-  private async refreshModelsInBackground(): Promise<void> {
-    const config = loadConfig();
-    const providerIds = Object.entries(config.providers as Record<string, ProviderConfig>)
-      .filter(([pid, pconfig]) => hasApiKey(pid, pconfig))
-      .map(([pid]) => pid);
-
-    for (const pid of providerIds) {
-      try {
-        const models = await refreshProviderModels(pid);
-        if (models.length > 0) {
-          setProviderModels(pid, models);
-        }
-      } catch {
-        // Ignore individual provider refresh failures
-      }
-    }
-
-    this.allChoices = this.buildAllChoices();
-    this.tabs = this.buildTabs(this.allChoices);
-    this.rebuildList();
-    this.ctx.showComponent(this);
-  }
-
-  private buildAllChoices(): ModelChoice[] {
-    const config = loadConfig();
-    const providers = config.providers;
-    const choices: ModelChoice[] = [];
-
-    for (const [pid, pconfig] of Object.entries(providers as Record<string, ProviderConfig>)) {
-      // Skip providers without API keys
-      if (!hasApiKey(pid, pconfig)) continue;
-
-      const models = getAvailableModels(pid);
-      for (const m of models) {
-        choices.push({
-          id: m.id,
-          label: m.label,
-          providerId: pid,
-          providerName: pconfig.name,
-          description: m.description ?? "",
-          displayLabel: `${m.label} (${pconfig.name})`,
-          reasoning: m.reasoning,
-        });
-      }
-    }
-
-    return choices;
-  }
-
-  private buildTabs(choices: ModelChoice[]): { id: string; label: string; icon: string; choices: ModelChoice[] }[] {
-    const providerMap = new Map<string, ModelChoice[]>();
-    for (const c of choices) {
-      if (!providerMap.has(c.providerId)) providerMap.set(c.providerId, []);
-      providerMap.get(c.providerId)!.push(c);
-    }
-
-    const tabs: { id: string; label: string; icon: string; choices: ModelChoice[] }[] = [];
-
-    // Add "All" tab only if there are multiple providers with keys
-    if (providerMap.size > 1) {
-      tabs.push({ id: "__all__", label: "All", icon: "📋", choices });
-    }
-
-    for (const [pid, pchoices] of providerMap) {
-      tabs.push({
-        id: pid,
-        label: pchoices[0]?.providerName ?? pid,
-        icon: providerIcon(pid),
-        choices: pchoices,
-      });
-    }
-
-    return tabs;
-  }
-
-  private buildListForTab(tabIndex: number, search: string): SelectList {
-    const tab = this.tabs[tabIndex];
-    if (!tab) return new SelectList([], 10, selectTheme);
-
-    let choices = tab.choices;
-
-    if (search) {
-      choices = fuzzyFilter(choices, search.toLowerCase(), (c) => c.displayLabel);
-    }
-
-    const currentModel = getActiveModel();
-    const items: SelectItem[] = choices.map((c) => {
-      const parts: string[] = [c.id];
-      if (c.description) parts.push(c.description);
-      const base = parts.join(" · ");
-      return {
-        value: c.id,
-        label: c.label,
-        description: c.id === currentModel
-          ? `${base}  ${GREEN}✓${RESET}`
-          : base,
-      };
-    });
-
-    if (items.length === 0) {
-      items.push({
-        value: "__none__",
-        label: search ? `No matches for "${search}"` : "No models available",
-        description: search ? "" : "Use /provider to configure an API key first",
-      });
-    }
-
-    const list = new SelectList(items, 12, selectTheme, selectLayout);
-    list.onSelect = (item) => {
-      if (item.value === "__none__") return;
-      const cfg = loadConfig();
-      cfg.active_model = item.value;
-      const choice = tab.choices.find((c) => c.id === item.value);
-      if (choice?.reasoning) {
-        cfg.thinking = this.thinkingDraft;
-        saveConfig(cfg);
-        this.ctx.addSystemMessage(
-          `${GREEN}Model set to ${item.label} (thinking ${this.thinkingDraft ? "ON" : "OFF"}).${RESET}`,
-        );
-      } else {
-        saveConfig(cfg);
-        this.ctx.addSystemMessage(
-          `${GREEN}Model set to ${item.label}.${RESET}`,
-        );
-      }
-      this.ctx.applyProvider();
-      this.ctx.done();
-    };
-    list.onCancel = () => {
-      this.ctx.done();
-    };
+    const items: SelectItem[] = this.filtered().map((choice) => ({
+      value: choice.key,
+      label: choice.model.label,
+      description: `${choice.providerName} · ${choice.model.id}${config.active_provider === choice.providerId && config.active_model === choice.model.id ? `  ${GREEN}✓${RESET}` : ""}`,
+    }));
+    if (!items.length) items.push({ value: "__none__", label: this.search ? "No matches" : "No configured models", description: "Use /provider first" });
+    const list = new SelectList(items, 12, theme, { maxPrimaryColumnWidth: 24 });
+    list.onSelect = (item) => this.confirm(item.value);
+    list.onCancel = () => this.ctx.done();
     return list;
   }
 
-  private rebuildList(): void {
-    // Detach old list callbacks before replacing to prevent leaks.
-    if (this.activeList) {
-      this.activeList.onSelect = undefined;
-      this.activeList.onCancel = undefined;
-    }
-    this.activeList = this.buildListForTab(this.activeTabIndex, this.searchQuery);
+  private rebuild(): void {
+    this.list.onSelect = undefined;
+    this.list.onCancel = undefined;
+    this.list = this.buildList();
   }
 
-  // -- Component ------------------------------------------------------------
+  private selectedChoice(): ModelChoice | undefined {
+    const key = this.list.getSelectedItem()?.value;
+    return this.choices.find((choice) => choice.key === key);
+  }
+  private preference(choice: ModelChoice): ThinkingPreference {
+    return this.drafts.get(choice.key) ?? { enabled: choice.model.reasoning.availability !== "none" };
+  }
+
+  private confirm(key: string): void {
+    if (key === "__none__") return;
+    const choice = this.choices.find((item) => item.key === key);
+    if (!choice) return;
+    setActiveSelection(choice.providerId, choice.model.id);
+    if (this.modified.has(choice.key)) setThinkingPreference(choice.providerId, choice.model, this.preference(choice));
+    const preference = this.preference(choice);
+    const thinking = choice.model.reasoning.availability === "none" ? "" : ` (Thinking ${preference.enabled ? preference.effort ?? "AUTO" : "OFF"})`;
+    this.ctx.addNotice(`${GREEN}Model set to ${choice.model.label} on ${choice.providerName}${thinking}.${RESET}`);
+    this.ctx.applyProvider();
+    this.ctx.done();
+  }
 
   render(width: number): string[] {
-    const lines: string[] = [];
-    const config = loadConfig();
-    const activeProvider = (config.providers as Record<string, ProviderConfig>)[config.active_provider];
-    const currentModel = getActiveModel();
-
-    // ── Header bar ──────────────────────────────────────────────
-    const headerIcon = providerIcon(config.active_provider);
-    const headerText = `${BOLD}Model${RESET}  ${DIM}${headerIcon} ${activeProvider?.name ?? config.active_provider} › ${currentModel}${RESET}`;
-    lines.push(headerText);
-
-    // ── Tab strip ───────────────────────────────────────────────
+    const lines = [`${BOLD}Model${RESET}  ${DIM}frozen provider/model snapshot${RESET}`];
     if (this.tabs.length > 1) {
-      lines.push(...this.renderTabs(width));
+      const tabLine = this.tabs.map((tab, index) => index === this.activeTabIndex
+        ? `${CYAN}▐${RESET} ${providerIcon(tab.id)} ${tab.label} (${tab.choices.length}) ${CYAN}▌${RESET}`
+        : `${DIM}${providerIcon(tab.id)} ${tab.label} (${tab.choices.length})${RESET}`).join("  ");
+      lines.push(truncateToWidth(` ${tabLine}`, Math.max(1, width), "…", true));
     }
-
-    // ── Search ──────────────────────────────────────────────────
-    if (this.searchQuery) {
-      lines.push(` ${CYAN}🔍 ${this.searchQuery}█${RESET}`);
-    } else {
-      lines.push(` ${DIM}🔍 Type to search...${RESET}`);
+    lines.push(this.search ? ` ${CYAN}🔍 ${this.search}█${RESET}` : ` ${DIM}🔍 Type to search...${RESET}`);
+    lines.push(...this.list.render(width));
+    const choice = this.selectedChoice();
+    if (choice) {
+      const preview = thinkingPreview(choice.model.reasoning, this.preference(choice));
+      if (preview) lines.push(truncateToWidth(` Thinking  ${preview}`, Math.max(1, width), "…", true));
     }
-
-    // ── Column headers ──────────────────────────────────────────
-    const barLen = Math.min(width - 3, 60);
-    lines.push(` ${BLUE}  Model${" ".repeat(22)}Details${RESET}`);
-    lines.push(` ${DIM}  ${"─".repeat(barLen)}${RESET}`);
-
-    // ── Model list ──────────────────────────────────────────────
-    const listLines = this.activeList.render(width);
-    lines.push(...listLines);
-
-    // ── Thinking toggle (only for reasoning-capable models) ─────
-    const selectedItem = this.activeList.getSelectedItem();
-    const selectedChoice = selectedItem
-      ? this.tabs[this.activeTabIndex]?.choices.find((c) => c.id === selectedItem.value)
-      : undefined;
-    const modelSupportsThinking = selectedChoice?.reasoning === true;
-
-    // Auto-enable thinking when landing on a reasoning-capable model
-    if (modelSupportsThinking && selectedItem && selectedItem.value !== this.lastSelectedModelId) {
-      this.thinkingDraft = true;
-    }
-    if (selectedItem) {
-      this.lastSelectedModelId = selectedItem.value;
-    }
-
-    if (modelSupportsThinking) {
-      lines.push(` ${DIM}  ${"─".repeat(barLen)}${RESET}`);
-
-      const thinking = this.thinkingDraft;
-      const onStyle = thinking ? `${GREEN}${BOLD}◉ ON${RESET}` : `${DIM}○ ON${RESET}`;
-      const offStyle = thinking ? `${DIM}○ OFF${RESET}` : `${GREEN}${BOLD}◉ OFF${RESET}`;
-      lines.push(` ${CYAN}Thinking${RESET}  ${DIM}←${RESET} ${onStyle}  │  ${offStyle} ${DIM}→${RESET}`);
-    }
-
-    // ── Footer ──────────────────────────────────────────────────
-    const hints = ["↑↓ pick", "↵ confirm"];
-    if (this.tabs.length > 1) hints.push("Tab provider");
-    hints.push("Esc cancel");
-    lines.push(` ${DIM}${hints.join("  ")}${RESET}`);
-
+    lines.push(` ${DIM}↑↓ pick  ←→ Thinking  ${this.tabs.length > 1 ? "Tab provider  " : ""}↵ confirm  Esc cancel${RESET}`);
     return lines;
   }
 
-  private renderTabs(width: number): string[] {
-    if (this.tabs.length === 0) return [];
-
-    const tabChars = this.tabs.map((t, i) => {
-      const count = t.choices.length;
-      const text = `${t.icon} ${t.label} (${count})`;
-      const isActive = i === this.activeTabIndex;
-      return { text, isActive, plainLen: text.length };
-    });
-
-    const availableWidth = width - 2;
-    const fullWidth = tabChars.reduce((sum, t) => sum + t.plainLen + 3, -1); // +3 padding per tab, -1 last spacer
-
-    if (fullWidth <= availableWidth) {
-      // All tabs fit — render with visual pill shapes
-      const parts: string[] = [];
-      for (let i = 0; i < tabChars.length; i++) {
-        const t = tabChars[i]!;
-        if (t.isActive) {
-          // Active tab: reversed background style
-          parts.push(`${CYAN}▐${RESET} ${t.text} ${CYAN}▌${RESET}`);
-        } else {
-          // Inactive tab: dimmed
-          parts.push(`${DIM} ${t.text} ${RESET}`);
-        }
-      }
-      return [` ${parts.join(" ")}`];
-    }
-
-    // Tabs overflow — scrolling window
-    const avgTabWidth = 14;
-    const VISIBLE_COUNT = Math.max(1, Math.floor(availableWidth / avgTabWidth));
-    let start = Math.max(0, this.activeTabIndex - Math.floor(VISIBLE_COUNT / 2));
-    let end = Math.min(start + VISIBLE_COUNT, tabChars.length);
-    if (end - start < VISIBLE_COUNT) start = Math.max(0, end - VISIBLE_COUNT);
-
-    const parts: string[] = [];
-    if (start > 0) parts.push(`${DIM}◀${RESET} `);
-    for (let i = start; i < end; i++) {
-      const t = tabChars[i]!;
-      if (t.isActive) {
-        parts.push(`${CYAN}▐${RESET} ${t.text} ${CYAN}▌${RESET}`);
-      } else {
-        parts.push(`${DIM} ${t.text} ${RESET}`);
-      }
-    }
-    if (end < tabChars.length) parts.push(` ${DIM}▶${RESET}`);
-    return [` ${parts.join(" ")}`];
-  }
-
   handleInput(data: string): void {
-    // Tab / Shift+Tab — cycle tabs (guard against empty tabs to avoid modulo-by-zero → NaN)
-    if (this.tabs.length > 0) {
-      if (matchesKey(data, Key.tab)) {
-        this.activeTabIndex = (this.activeTabIndex + 1) % this.tabs.length;
-        this.searchQuery = "";
-        this.rebuildList();
-        this.ctx.showComponent(this);
-        return;
-      }
-      if (matchesKey(data, Key.shift(Key.tab))) {
-        this.activeTabIndex = (this.activeTabIndex - 1 + this.tabs.length) % this.tabs.length;
-        this.searchQuery = "";
-        this.rebuildList();
-        this.ctx.showComponent(this);
-        return;
-      }
-    }
-
-    // Left → thinking ON, Right → thinking OFF
-    if (matchesKey(data, Key.left)) {
-      this.thinkingDraft = true;
+    if (this.tabs.length > 1 && (matchesKey(data, Key.tab) || matchesKey(data, Key.shift(Key.tab)))) {
+      const direction = matchesKey(data, Key.tab) ? 1 : -1;
+      this.activeTabIndex = (this.activeTabIndex + direction + this.tabs.length) % this.tabs.length;
+      this.search = "";
+      this.rebuild();
       this.ctx.showComponent(this);
       return;
     }
-    if (matchesKey(data, Key.right)) {
-      this.thinkingDraft = false;
-      this.ctx.showComponent(this);
+    const choice = this.selectedChoice();
+    if (choice && (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
+      const states = thinkingStates(choice.model.reasoning);
+      const next = cycleThinkingState(states, this.preference(choice), matchesKey(data, Key.left) ? -1 : 1);
+      if (next && states.length > 1) {
+        this.drafts.set(choice.key, { enabled: next.enabled, effort: next.effort });
+        this.modified.add(choice.key);
+        this.ctx.showComponent(this);
+      }
       return;
     }
-
-    // Escape
     if (matchesKey(data, Key.escape)) {
-      if (this.searchQuery) {
-        this.searchQuery = "";
-        this.rebuildList();
-        this.ctx.showComponent(this);
-      } else {
-        this.ctx.done();
-      }
+      if (this.search) { this.search = ""; this.rebuild(); this.ctx.showComponent(this); }
+      else this.ctx.done();
       return;
     }
-
-    // Backspace
     if (matchesKey(data, Key.backspace)) {
-      if (this.searchQuery.length > 0) {
-        this.searchQuery = this.searchQuery.slice(0, -1);
-        this.rebuildList();
-        this.ctx.showComponent(this);
-      }
+      if (this.search) { this.search = this.search.slice(0, -1); this.rebuild(); this.ctx.showComponent(this); }
       return;
     }
-
-    // Enter
-    if (matchesKey(data, Key.enter)) {
-      this.activeList.handleInput(data);
-      return;
-    }
-
-    // Printable character → search
-    if (data.length === 1 && data >= " ") {
-      this.searchQuery += data;
-      this.rebuildList();
-      this.ctx.showComponent(this);
-      return;
-    }
-
-    // Arrow keys → list
-    this.activeList.handleInput(data);
+    if (matchesKey(data, Key.enter)) { this.list.handleInput(data); return; }
+    if (data.length === 1 && data >= " ") { this.search += data; this.rebuild(); this.ctx.showComponent(this); return; }
+    this.list.handleInput(data);
     this.ctx.showComponent(this);
   }
 
-  invalidate(): void {
-    this.activeList.invalidate();
-  }
+  invalidate(): void { this.list.invalidate(); }
 }
 
-// ---------------------------------------------------------------------------
-// Command entry point
-// ---------------------------------------------------------------------------
-
-export function executeModelCommand(ctx: CommandContext): void {
-  const ui = new TabbedModelSelector(ctx);
-  ctx.showComponent(ui);
-}
+export function executeModelCommand(ctx: CommandContext): void { ctx.showComponent(new ModelSelector(ctx)); }
