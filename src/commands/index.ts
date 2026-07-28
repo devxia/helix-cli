@@ -9,9 +9,9 @@ export interface CommandContext {
   showComponent(component: Component): void;
   /** Restore the editor focus. Call when the command is done. */
   done(): void;
-  /** Add a system message to the chat log. */
-  addSystemMessage(text: string): void;
-  /** Re-create the OpenAI client (e.g. after provider change). */
+  /** Add a UI-only notice to the chat log. */
+  addNotice(text: string): void;
+  /** Re-create the active LLM adapter (e.g. after provider change). */
   applyProvider(): void;
 }
 

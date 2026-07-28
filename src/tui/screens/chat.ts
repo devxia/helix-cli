@@ -11,18 +11,16 @@ import {
   matchesKey,
 } from "@earendil-works/pi-tui";
 import {
+  type ModelDef,
   type ProviderConfig,
   getActiveProvider,
-  getActiveModel,
   getAvailableModels,
-  hasApiKey,
-  isThinkingEnabled,
+  hasCredentials,
   refreshProviderModels,
   loadConfig,
-  resolveApiKey,
-  resolveBaseUrl,
-  setProviderModels,
-  ENV_MODEL_MAP,
+  resolveCredentials,
+  resolveThinkingPreference,
+  setCatalogProviderModels,
 } from "../../config.js";
 import { type CommandContext, registry } from "../../commands/index.js";
 import { executeProviderCommand } from "../../commands/provider.js";
@@ -30,16 +28,24 @@ import { executeModelCommand } from "../../commands/model.js";
 import { preloadCatalogModels } from "../../catalog.js";
 import { createLLMProvider } from "../../llm/factory.js";
 import type { LLMProvider } from "../../llm/provider.js";
-import type { LLMEvent } from "../../llm/types.js";
 import { providerIcon } from "../../utils/icons.js";
 import { RESET, DIM, BOLD, CYAN, GREEN, RED, YELLOW } from "../../utils/ansi.js";
+import { buildConversation, settleOwnedRequest, type ConversationLogItem } from "../conversation.js";
 
-type ChatMessage = {
-  role: "user" | "assistant" | "system";
-  content: string;
-  thinking?: string;
-  thinkingExpanded?: boolean;
-};
+type NoticeMessage = Extract<ConversationLogItem, { role: "notice" }>;
+type UserMessage = Extract<ConversationLogItem, { role: "user" }>;
+type AssistantMessage = Extract<ConversationLogItem, { role: "assistant" }> & { thinkingExpanded?: boolean };
+type ChatMessage = NoticeMessage | UserMessage | AssistantMessage;
+type ActiveRequest = { controller: AbortController; assistant: AssistantMessage };
+
+export function clearConversationLog<T extends { role: string }>(messages: readonly T[]): T[] {
+  return messages.filter((message) => message.role === "notice");
+}
+
+export function terminalGeometry(columns: number, rows: number): { width: number; height: number; innerWidth: number } {
+  const width = Math.max(1, Math.floor(columns));
+  return { width, height: Math.max(1, Math.floor(rows)), innerWidth: Math.max(0, width - 2) };
+}
 
 const editorTheme: EditorTheme = {
   borderColor: (text) => `${CYAN}${text}${RESET}`,
@@ -54,180 +60,91 @@ const editorTheme: EditorTheme = {
 
 export class ChatScreen implements Component, Focusable {
   focused = false;
-
   private readonly editor: Editor;
-  private provider: LLMProvider;
-  private model: string;
-  private messages: ChatMessage[] = [
-    {
-      role: "system",
-      content: "Ready. Type a message and press Enter.",
-    },
-  ];
-  private activeRequest: AbortController | null = null;
+  private provider: LLMProvider | null = null;
+  private model = "";
+  private messages: ChatMessage[] = [{ role: "notice", content: "Ready. Type a message and press Enter." }];
+  private activeRequest: ActiveRequest | null = null;
   private exitOnNextInterrupt = false;
   private status = "Idle";
   private showHelpOverlay = false;
-  /** Separate input history so Alt+↑/↓ works even inside multi-line input. */
+  private pendingClear = false;
   private inputHistory: string[] = [];
   private inputHistoryIndex = -1;
-  /** When set, the editor is replaced by a command UI component. */
   private commandComponent: Component | null = null;
 
   constructor(private readonly tui: TUI) {
-    this.provider = this.createProvider();
-    this.model = this.resolveModel();
-
-    // If no provider has a key, show setup guidance
-    const anyKeyConfigured = Object.entries(loadConfig().providers as Record<string, ProviderConfig>).some(
-      ([id, p]) => hasApiKey(id, p),
-    );
-    if (!anyKeyConfigured) {
+    this.applyConfiguredProvider();
+    const anyReady = Object.values(loadConfig().providers).some(hasCredentials);
+    if (!anyReady) {
       this.messages = [
-        { role: "system", content: `${CYAN}Welcome to Helix CLI!${RESET}` },
-        { role: "system", content: `No API key configured yet.` },
-        { role: "system", content: `Type ${GREEN}/provider${RESET} to set up an LLM provider and start chatting.` },
+        { role: "notice", content: `${CYAN}Welcome to Helix CLI!${RESET}` },
+        { role: "notice", content: `No provider credentials configured yet.` },
+        { role: "notice", content: `Type ${GREEN}/provider${RESET} to select and configure a provider.` },
       ];
-      this.status = "No API key — type /provider to get started";
+      this.status = "No provider — type /provider";
     }
 
     this.editor = new Editor(tui, editorTheme, { paddingX: 1 });
-    this.editor.onSubmit = (text) => {
-      void this.handleSubmit(text);
-    };
+    this.editor.onSubmit = (text) => { void this.handleSubmit(text); };
+    registry.register({ name: "provider", description: "Configure or switch LLM provider", execute: executeProviderCommand });
+    registry.register({ name: "model", description: "Select provider/model and Thinking state", execute: executeModelCommand });
 
-    // -- Register slash commands -------------------------------------------
-    registry.register({
-      name: "provider",
-      description: "Select an LLM provider and enter API key",
-      execute: (ctx) => executeProviderCommand(ctx),
-    });
-    registry.register({
-      name: "model",
-      description: "Select model and toggle thinking mode",
-      execute: (ctx) => executeModelCommand(ctx),
+    const config = loadConfig();
+    if (config.active_provider) void refreshProviderModels(config.active_provider);
+    void preloadCatalogModels().then((catalog) => {
+      for (const [providerId, models] of catalog) setCatalogProviderModels(providerId, models);
     });
 
-    // Fetch fresh model list from provider API in the background
-    const providerId = loadConfig().active_provider;
-    refreshProviderModels(providerId);
-
-    // Pre-populate models from catalog cache (fast, no network needed)
-    preloadCatalogModels().then((catalogModels) => {
-      for (const [pid, models] of catalogModels) {
-        setProviderModels(pid, models);
-      }
-    });
-
-    // Wire up slash-command autocomplete
-    const slashCommands = registry.list().map((cmd) => ({
-      name: cmd.name,
-      description: cmd.description,
-    }));
-    this.editor.setAutocompleteProvider(
-      new CombinedAutocompleteProvider(slashCommands, process.cwd()),
-    );
+    this.editor.setAutocompleteProvider(new CombinedAutocompleteProvider(
+      registry.list().map((command) => ({ name: command.name, description: command.description })),
+      process.cwd(),
+    ));
   }
 
-  // -- Provider helpers ----------------------------------------------------
+  isStreaming(): boolean { return this.activeRequest !== null; }
 
-  private thinkingEnabled(): boolean {
-    return isThinkingEnabled();
-  }
-
-  /** Whether the *currently active model* advertises reasoning support. */
-  private currentModelSupportsThinking(): boolean {
-    const providerId = loadConfig().active_provider;
-    const models = getAvailableModels(providerId);
-    const current = models.find((m) => m.id === this.model);
-    return current?.reasoning === true;
-  }
-
-
-
-  isStreaming(): boolean {
-    return this.activeRequest !== null;
-  }
-
-  private createProvider(): LLMProvider {
+  private applyConfiguredProvider(): void {
+    const config = loadConfig();
     const provider = getActiveProvider();
-    const providerId = loadConfig().active_provider;
-    const apiKey = resolveApiKey(providerId, provider);
-    const baseURL = resolveBaseUrl(providerId, provider);
-
-    // Use a placeholder key when none is set so the TUI can start; real auth
-    // errors surface when the user sends their first message.
-    return createLLMProvider(providerId, provider, apiKey, baseURL);
+    this.model = process.env.HELIX_MODEL || config.active_model || "";
+    if (!provider || !hasCredentials(provider)) { this.provider = null; return; }
+    try { this.provider = createLLMProvider(config.active_provider!, provider, resolveCredentials(provider)); }
+    catch { this.provider = null; }
   }
 
-  private resolveModel(): string {
-    // Generic override applies to any provider
-    const helixModel = process.env.HELIX_MODEL;
-    if (helixModel) return helixModel;
-
-    // Per-provider env var (e.g. DEEPSEEK_MODEL, OPENAI_MODEL, …)
-    const providerId = loadConfig().active_provider;
-    const envVar = ENV_MODEL_MAP[providerId];
-    if (envVar) {
-      const envValue = process.env[envVar];
-      if (envValue) return envValue;
-    }
-
-    return getActiveModel();
-  }
-
-  private resolveProvider() {
-    const providerId = loadConfig().active_provider;
-    const provider = getActiveProvider();
-    const apiKey = resolveApiKey(providerId, provider);
-    const baseUrl = resolveBaseUrl(providerId, provider);
-    return {
-      name: provider.name,
-      base_url: baseUrl,
-      api_key: apiKey,
+  private activeModelDef(providerId: string, modelId: string): ModelDef {
+    return getAvailableModels(providerId).find((model) => model.id === modelId) ?? {
+      id: modelId,
+      label: modelId,
+      reasoning: { availability: "none", persistence: "none" },
+      reasoningKnown: false,
+      context: 8_000,
     };
   }
-
-  // -- CommandContext implementation ---------------------------------------
 
   private getCommandContext(): CommandContext {
     return {
-      showComponent: (component) => {
-        this.commandComponent = component;
-        this.tui.setFocus(this);
-        this.tui.requestRender(true);
-      },
-      done: () => {
-        this.commandComponent = null;
-        this.tui.requestRender(true);
-      },
-      addSystemMessage: (text) => {
-        this.messages.push({ role: "system", content: text });
-      },
+      showComponent: (component) => { this.commandComponent = component; this.tui.setFocus(this); this.tui.requestRender(true); },
+      done: () => { this.commandComponent = null; this.tui.requestRender(true); },
+      addNotice: (text) => { this.messages.push({ role: "notice", content: text }); },
       applyProvider: () => {
-        this.provider = this.createProvider();
-        this.model = this.resolveModel();
-        // Refresh model list for the new provider
+        this.applyConfiguredProvider();
         const providerId = loadConfig().active_provider;
-        refreshProviderModels(providerId);
+        if (providerId) void refreshProviderModels(providerId);
       },
     };
   }
 
   handleInterrupt(): boolean {
     if (this.activeRequest) {
-      this.activeRequest.abort();
-      this.activeRequest = null;
+      this.activeRequest.controller.abort();
       this.exitOnNextInterrupt = true;
-      this.status = "Stopped. Press Ctrl+C again to exit.";
+      this.status = "Stopping...";
       this.tui.requestRender(true);
       return true;
     }
-
-    if (this.exitOnNextInterrupt) {
-      return false;
-    }
-
+    if (this.exitOnNextInterrupt) return false;
     this.exitOnNextInterrupt = true;
     this.status = "Press Ctrl+C again to exit.";
     this.tui.requestRender(true);
@@ -235,146 +152,102 @@ export class ChatScreen implements Component, Focusable {
   }
 
   clearChat(): void {
-    // Keep only the initial system welcome message(s)
-    this.messages = this.messages.filter((m) => m.role === "system");
+    if (this.activeRequest) {
+      this.pendingClear = true;
+      this.activeRequest.controller.abort();
+      this.status = "Stopping...";
+      this.tui.requestRender(true);
+      return;
+    }
+    this.messages = clearConversationLog(this.messages);
     this.status = "Chat cleared";
     this.tui.requestRender(true);
   }
 
-  toggleHelpOverlay(): void {
-    this.showHelpOverlay = !this.showHelpOverlay;
-    this.tui.requestRender(true);
-  }
-
-  handleInput(data: string): void {
-    if (this.commandComponent?.handleInput) {
-      this.commandComponent.handleInput(data);
-      this.tui.requestRender();
-      return;
-    }
-
-    this.exitOnNextInterrupt = false;
-    if (!this.activeRequest && this.status === "Press Ctrl+C again to exit.") {
-      this.status = "Idle";
-    }
-
-    // Toggle thinking expansion for the last assistant message when the editor is empty.
-    // Otherwise the "t" keystroke should go into the input.
-    if (data === "t" && !this.commandComponent && !this.activeRequest && this.editor.getText().trim() === "") {
-      this.toggleLastThinkingExpansion();
-      return;
-    }
-
-    // Alt+↑/↓ cycle input history even inside multi-line input
-    if (matchesKey(data, "alt+up")) {
-      this.cycleInputHistory(-1);
-      return;
-    }
-    if (matchesKey(data, "alt+down")) {
-      this.cycleInputHistory(1);
-      return;
-    }
-
-    this.editor.handleInput(data);
-  }
-
-  private cycleInputHistory(direction: -1 | 1): void {
-    if (this.inputHistory.length === 0) return;
-
-    const nextIndex = this.inputHistoryIndex + direction;
-    if (nextIndex < -1 || nextIndex >= this.inputHistory.length) return;
-
-    this.inputHistoryIndex = nextIndex;
-    const text = this.inputHistory[this.inputHistoryIndex] ?? "";
-    this.editor.setText(text);
-    this.tui.requestRender(true);
-  }
-
-  private toggleLastThinkingExpansion(): void {
-    for (let i = this.messages.length - 1; i >= 0; i--) {
-      const m = this.messages[i];
-      if (m.role === "assistant" && m.thinking) {
-        m.thinkingExpanded = !m.thinkingExpanded;
+  toggleHelpOverlay(): void { this.showHelpOverlay = !this.showHelpOverlay; this.tui.requestRender(true); }
+  toggleLastThinkingExpansion(): void {
+    for (let index = this.messages.length - 1; index >= 0; index--) {
+      const message = this.messages[index];
+      if (message?.role === "assistant" && message.thinking) {
+        message.thinkingExpanded = !message.thinkingExpanded;
         this.tui.requestRender(true);
         return;
       }
     }
   }
 
-  invalidate(): void {
-    this.editor.invalidate();
-    this.commandComponent?.invalidate();
+  handleInput(data: string): void {
+    if (this.commandComponent?.handleInput) { this.commandComponent.handleInput(data); this.tui.requestRender(); return; }
+    this.exitOnNextInterrupt = false;
+    if (!this.activeRequest && this.status === "Press Ctrl+C again to exit.") this.status = "Idle";
+    if (matchesKey(data, "alt+up")) { this.cycleInputHistory(-1); return; }
+    if (matchesKey(data, "alt+down")) { this.cycleInputHistory(1); return; }
+    this.editor.handleInput(data);
   }
 
+  private cycleInputHistory(direction: -1 | 1): void {
+    if (!this.inputHistory.length) return;
+    const next = this.inputHistoryIndex + direction;
+    if (next < -1 || next >= this.inputHistory.length) return;
+    this.inputHistoryIndex = next;
+    this.editor.setText(this.inputHistory[next] ?? "");
+    this.tui.requestRender(true);
+  }
+
+  invalidate(): void { this.editor.invalidate(); this.commandComponent?.invalidate(); }
+
   render(width: number): string[] {
-    const safeWidth = Math.max(24, width);
-    const height = Math.max(10, this.tui.terminal.rows);
-    const innerWidth = safeWidth - 2;
+    const geometry = terminalGeometry(width, this.tui.terminal.rows);
+    const safeWidth = geometry.width;
+    const height = geometry.height;
+    const innerWidth = geometry.innerWidth;
+    if (safeWidth < 3) return [truncateToWidth("H", safeWidth, "", false)].slice(0, height);
+    const inputLines = this.commandComponent
+      ? this.commandComponent.render(innerWidth)
+      : this.editor.render(innerWidth).slice(0, Math.max(3, Math.floor(height * 0.5)));
+    const messageRows = Math.max(1, height - 5 - inputLines.length);
+    const display = this.showHelpOverlay ? this.renderHelpOverlay(messageRows) : this.renderMessages(innerWidth, messageRows);
+    const lines = [this.topBorder(safeWidth), this.frameLine(`${GREEN}Helix Cli v0.0.2${RESET}`, innerWidth), this.separator(safeWidth, this.showHelpOverlay ? " Help " : " Messages ")];
+    for (const line of display) lines.push(this.frameLine(line, innerWidth));
+    lines.push(this.separator(safeWidth, this.commandComponent ? " Command " : " Input "));
+    for (const line of inputLines) lines.push(this.frameLine(line, innerWidth));
 
-    // Command mode: swap editor for command UI
-    let inputLines: string[];
-    let inputLabel = " Input ";
-    if (this.commandComponent) {
-      inputLines = this.commandComponent.render(innerWidth);
-      inputLabel = " Command ";
-    } else {
-      const maxInputRows = Math.max(3, Math.floor(height * 0.5));
-      inputLines = this.editor.render(innerWidth).slice(0, maxInputRows);
-    }
-
-    const fixedRows = 5 + inputLines.length;
-    const messageRows = Math.max(1, height - fixedRows);
-    const messageLines = this.renderMessages(innerWidth, messageRows);
-    const displayLines = this.showHelpOverlay
-      ? this.renderHelpOverlay(innerWidth, messageRows)
-      : messageLines;
-    const lines: string[] = [];
-
-    lines.push(this.topBorder(safeWidth));
-    lines.push(this.frameLine(`${GREEN}Helix Cli v0.0.2${RESET}`, innerWidth));
-    lines.push(this.separator(safeWidth, this.showHelpOverlay ? " Help " : " Messages "));
-
-    for (const line of displayLines) {
-      lines.push(this.frameLine(line, innerWidth));
-    }
-
-    lines.push(this.separator(safeWidth, inputLabel));
-
-    for (const line of inputLines) {
-      lines.push(this.frameLine(line, innerWidth));
-    }
-
-    // Model info line — show provider or hint to set one up
+    const config = loadConfig();
     const provider = getActiveProvider();
-    const providerId = loadConfig().active_provider;
-    const providerHasKey = hasApiKey(providerId, provider);
-    const typeIcon = providerIcon(providerId);
-    const model = this.model;
-    const showThinking = this.thinkingEnabled() && this.currentModelSupportsThinking();
-    const info = providerHasKey
-      ? `${DIM}${typeIcon} ${provider.name} · ${model}${showThinking ? ` · 💭 thinking` : ""}${RESET}`
-      : `${DIM}${typeIcon} ${provider.name}${RESET}  ${YELLOW}(no API key — type /provider)${RESET}`;
+    const ready = provider ? hasCredentials(provider) : false;
+    const info = provider && config.active_provider
+      ? ready
+        ? `${DIM}${providerIcon(config.active_provider)} ${provider.name} · ${this.model}${RESET}`
+        : `${DIM}${providerIcon(config.active_provider)} ${provider.name}${RESET} ${YELLOW}(credentials missing)${RESET}`
+      : `${DIM}No configured provider${RESET} ${YELLOW}(type /provider)${RESET}`;
     lines.push(this.frameLine(info, innerWidth));
-
     lines.push(this.bottomBorder(safeWidth, this.status));
-
     return lines.slice(0, height);
   }
 
   private async handleSubmit(text: string): Promise<void> {
     const input = text.trim();
-    if (!input || this.activeRequest || this.commandComponent) {
-      return;
-    }
-
-    // Slash command routing
-    const cmd = registry.parse(input);
-    if (cmd) {
-      this.messages.push({ role: "user", content: input });
-      cmd.execute(this.getCommandContext());
+    if (!input || this.activeRequest || this.commandComponent) return;
+    const command = registry.parse(input);
+    if (command) {
+      this.editor.setText("");
+      command.execute(this.getCommandContext());
       this.tui.requestRender(true);
       return;
     }
+
+    const config = loadConfig();
+    const providerConfig = config.active_provider ? config.providers[config.active_provider] : undefined;
+    const adapter = this.provider;
+    const providerId = config.active_provider;
+    const modelId = process.env.HELIX_MODEL || config.active_model || this.model;
+    if (!providerConfig || !providerId || !adapter || !modelId || !hasCredentials(providerConfig)) {
+      this.messages.push({ role: "notice", content: `${RED}No ready provider/model. Use /provider and /model first.${RESET}` });
+      this.tui.requestRender(true);
+      return;
+    }
+    const model = this.activeModelDef(providerId, modelId);
+    const preference = resolveThinkingPreference(providerId, model);
 
     this.exitOnNextInterrupt = false;
     this.editor.addToHistory(input);
@@ -382,192 +255,123 @@ export class ChatScreen implements Component, Focusable {
     this.inputHistoryIndex = -1;
     this.editor.setText("");
     this.messages.push({ role: "user", content: input });
-    this.messages.push({ role: "assistant", content: "" });
+    const conversation = buildConversation(this.messages, { contextLimit: model.context, thinkingPersistence: model.reasoning.persistence });
+    if (!conversation.ok) {
+      this.messages.push({ role: "notice", content: `${RED}Error:${RESET} ${conversation.error}` });
+      this.status = "Input rejected locally";
+      this.tui.requestRender(true);
+      return;
+    }
+
+    const assistant: AssistantMessage = { role: "assistant", content: "", state: "pending", thinkingExpanded: true };
+    this.messages.push(assistant);
+    const owner: ActiveRequest = { controller: new AbortController(), assistant };
+    this.activeRequest = owner;
     this.status = "Streaming...";
     this.tui.requestRender(true);
-
-    const controller = new AbortController();
-    this.activeRequest = controller;
-
-    let reply = "";
-    let thinking = "";
-    let state: "thinking" | "answering" = "thinking";
+    let errorMessage: string | undefined;
 
     try {
-      const stream = this.provider.stream({
-        messages: this.toLLMMessages(),
-        options: {
-          model: this.model,
-          thinking: this.currentModelSupportsThinking() && this.thinkingEnabled(),
-        },
-        signal: controller.signal,
+      const stream = adapter.stream({
+        messages: conversation.messages,
+        options: { model: modelId, thinking: model.reasoning.availability === "none" ? undefined : preference },
+        signal: owner.controller.signal,
       });
-
       for await (const event of stream) {
-        if (controller.signal.aborted) break;
-        this.handleLLMEvent(event);
-
+        if (this.activeRequest !== owner || owner.controller.signal.aborted) break;
         if (event.type === "content") {
           if (event.part.type === "think") {
-            thinking += event.part.think;
+            assistant.thinking = (assistant.thinking ?? "") + event.part.think;
             this.status = "Thinking...";
           } else {
-            if (state === "thinking") {
-              state = "answering";
-            }
-            reply += event.part.text;
+            assistant.content += event.part.text;
             this.status = "Streaming...";
           }
-          this.updateLastAssistantMessage(reply, thinking);
           this.tui.requestRender();
-        } else if (event.type === "status") {
-          // Could surface token usage in status line later.
         } else if (event.type === "error") {
-          this.messages.push({
-            role: "system",
-            content: `${RED}Error:${RESET} ${event.error.message}`,
-          });
+          errorMessage = event.error.message;
         }
       }
-
-      if (!controller.signal.aborted) {
-        this.status = "Idle";
-      }
-    } catch (err) {
-      if ((err as Error).name === "AbortError") {
-        this.updateLastAssistantMessage("[stopped]");
-      } else {
-        this.messages.push({
-          role: "system",
-          content: `${RED}Error:${RESET} ${(err as Error).message}`,
-        });
-      }
+    } catch (error) {
+      if (!owner.controller.signal.aborted) errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
-      this.activeRequest = null;
-      if (this.status === "Streaming..." || this.status === "Thinking...") {
-        this.status = "Idle";
+      const settlement = settleOwnedRequest(this.activeRequest, owner, {
+        aborted: owner.controller.signal.aborted,
+        hasOutput: !!assistant.content || !!assistant.thinking,
+        hasError: !!errorMessage,
+        pendingClear: this.pendingClear,
+      });
+      if (settlement) {
+        assistant.state = settlement.state;
+        if (settlement.removeAssistant) {
+          const index = this.messages.indexOf(assistant);
+          if (index >= 0) this.messages.splice(index, 1);
+        }
+        if (settlement.showError) this.messages.push({ role: "notice", content: `${RED}Error:${RESET} ${errorMessage}` });
+        this.activeRequest = null;
+        if (settlement.clearConversation) {
+          this.messages = clearConversationLog(this.messages);
+          this.pendingClear = false;
+        }
+        this.status = settlement.status;
       }
       this.tui.requestRender(true);
     }
   }
 
-  private handleLLMEvent(_event: LLMEvent): void {
-    // Hook for future handling (tool calls, subagent events, etc.)
-  }
-
-  private toLLMMessages(): Array<
-    | { role: "user"; content: [{ type: "text"; text: string }] }
-    | { role: "assistant"; content: [{ type: "text"; text: string }] }
-  > {
-    return this.messages
-      .filter((m): m is ChatMessage & { role: "user" | "assistant" } => m.role === "user" || m.role === "assistant")
-      .map((m) => ({
-        role: m.role,
-        content: [{ type: "text" as const, text: m.content }],
-      }));
-  }
-
-  private updateLastAssistantMessage(content: string, thinking?: string): void {
-    const last = this.messages[this.messages.length - 1];
-    if (last?.role === "assistant") {
-      last.content = content;
-      if (thinking) {
-        last.thinking = thinking;
-      }
-    }
-  }
-
-  private renderHelpOverlay(width: number, maxRows: number): string[] {
-    const rendered: string[] = [];
-    const add = (text: string) => rendered.push(` ${text}`);
-
-    add(`${BOLD}Global shortcuts${RESET}`);
-    add("");
-    add(`${CYAN}Esc${RESET}        Interrupt streaming / exit confirmation`);
-    add(`${CYAN}Ctrl+L${RESET}     Clear chat`);
-    add(`${CYAN}Ctrl+/${RESET}     Toggle this help overlay`);
-    add("");
-    add(`${BOLD}Slash commands${RESET}`);
-    add("");
-    add(`${GREEN}/provider${RESET}  Configure or switch LLM provider`);
-    add(`${GREEN}/model${RESET}     Select model and toggle thinking`);
-    add("");
-    add(`${DIM}Press Ctrl+/ to close${RESET}`);
-
-    while (rendered.length < maxRows) rendered.push("");
-    return rendered.slice(0, maxRows);
+  private renderHelpOverlay(maxRows: number): string[] {
+    const lines = [
+      ` ${BOLD}Global shortcuts${RESET}`, "",
+      ` ${CYAN}Esc${RESET}        Interrupt streaming`,
+      ` ${CYAN}Ctrl+L${RESET}     Clear chat`,
+      ` ${CYAN}Ctrl+T${RESET}     Toggle latest Thinking display`,
+      ` ${CYAN}Ctrl+/${RESET}     Toggle this help overlay`, "",
+      ` ${BOLD}Slash commands${RESET}`, "",
+      ` ${GREEN}/provider${RESET}  Configure or switch provider`,
+      ` ${GREEN}/model${RESET}     Select provider/model and Thinking`, "",
+      ` ${DIM}Press Ctrl+/ to close${RESET}`,
+    ];
+    while (lines.length < maxRows) lines.push("");
+    return lines.slice(0, maxRows);
   }
 
   private renderMessages(width: number, maxRows: number): string[] {
     const rendered: string[] = [];
-    const thinkPrefix = `${DIM}${YELLOW}> ${RESET}${DIM}`;
-    const showThinking = this.thinkingEnabled() && this.currentModelSupportsThinking();
-
     for (const message of this.messages) {
-      // Render thinking first (dimmed yellow) — only when thinking is enabled and not collapsed
-      const thinkingExpanded = message.thinkingExpanded !== false;
-      if (showThinking && message.role === "assistant" && message.thinking && thinkingExpanded) {
-        const wrapped = wrapTextWithAnsi(
-          `${thinkPrefix}${message.thinking}`,
-          Math.max(1, width - 2),
-        );
-        for (const line of wrapped) {
-          rendered.push(` ${line}`);
+      if (message.role === "assistant" && message.thinking) {
+        if (message.thinkingExpanded !== false) {
+          for (const line of wrapTextWithAnsi(`${DIM}${YELLOW}> ${RESET}${DIM}${message.thinking}${RESET}`, Math.max(1, width - 2))) rendered.push(` ${line}`);
+          rendered.push("");
+        } else {
+          rendered.push(` ${DIM}[Thinking hidden — press ${YELLOW}Ctrl+T${RESET}${DIM} to expand]${RESET}`);
+          rendered.push("");
         }
-        // Empty separator line between thinking and answer
-        rendered.push("");
-      } else if (showThinking && message.role === "assistant" && message.thinking && !thinkingExpanded) {
-        rendered.push(` ${DIM}[thinking hidden — press ${YELLOW}t${RESET}${DIM} to expand]${RESET}`);
-        rendered.push("");
       }
-
-      const prefix = this.messagePrefix(message.role);
-      const wrapped = wrapTextWithAnsi(`${prefix}${message.content || " "}`, Math.max(1, width - 2));
-      for (const line of wrapped) {
-        rendered.push(` ${line}`);
-      }
+      const prefix = message.role === "user" ? "You: " : message.role === "assistant" ? "Helix: " : DIM;
+      const body = message.role === "assistant" && !message.content
+        ? message.state === "pending" ? `${DIM}…${RESET}` : ""
+        : message.content;
+      if (body) for (const line of wrapTextWithAnsi(`${prefix}${body}`, Math.max(1, width - 2))) rendered.push(` ${line}`);
+      if (message.role === "assistant" && message.state === "stopped") rendered.push(` ${DIM}[stopped]${RESET}`);
     }
-
     const visible = rendered.slice(-maxRows);
-    while (visible.length < maxRows) {
-      visible.unshift("");
-    }
-
+    while (visible.length < maxRows) visible.unshift("");
     return visible;
   }
 
-  private messagePrefix(role: ChatMessage["role"]): string {
-    if (role === "user") {
-      return "You: ";
-    }
-    if (role === "assistant") {
-      return "Helix: ";
-    }
-    return `${DIM}`;
-  }
-
-  private topBorder(width: number): string {
-    return `┌${"─".repeat(width - 2)}┐`;
-  }
-
+  private topBorder(width: number): string { return `┌${"─".repeat(width - 2)}┐`; }
   private separator(width: number, label: string): string {
-    const labelWidth = visibleWidth(label);
-    const remaining = Math.max(0, width - labelWidth - 2);
+    const visibleLabel = truncateToWidth(label, Math.max(1, width - 2), "", false);
+    const remaining = Math.max(0, width - visibleWidth(visibleLabel) - 2);
     const left = Math.floor(remaining / 2);
-    const right = remaining - left;
-    return `├${"─".repeat(left)}${label}${"─".repeat(right)}┤`;
+    return `├${"─".repeat(left)}${visibleLabel}${"─".repeat(remaining - left)}┤`;
   }
-
   private bottomBorder(width: number, status: string): string {
     const label = ` ${status} `;
-    const labelWidth = visibleWidth(label);
-    const remaining = Math.max(0, width - labelWidth - 2);
-    return `└${"─".repeat(remaining)}${truncateToWidth(label, width - 2, "", false)}┘`;
+    return `└${"─".repeat(Math.max(0, width - visibleWidth(label) - 2))}${truncateToWidth(label, width - 2, "", false)}┘`;
   }
-
   private frameLine(content: string, width: number): string {
     const line = truncateToWidth(content, width, "...", true);
-    const padding = " ".repeat(Math.max(0, width - visibleWidth(line)));
-    return `│${line}${padding}│`;
+    return `│${line}${" ".repeat(Math.max(0, width - visibleWidth(line)))}│`;
   }
 }

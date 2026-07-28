@@ -1,11 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import type { ProviderType, ModelDef } from "./config.js";
-
-// ---------------------------------------------------------------------------
-// Catalog types (from models.dev/api.json)
-// ---------------------------------------------------------------------------
+import type { ProviderType, ModelDef, ReasoningCapability } from "./config.js";
 
 export interface CatalogModel {
   id: string;
@@ -16,32 +12,15 @@ export interface CatalogModel {
   tool_call: boolean;
   temperature?: boolean;
   structured_output?: boolean;
-  knowledge?: string;
-  release_date?: string;
-  last_updated?: string;
-  modalities: {
-    input: string[];
-    output: string[];
-  };
-  open_weights?: boolean;
-  limit: {
-    context: number;
-    output: number;
-    input?: number;
-  };
-  cost?: {
-    input: number;
-    output: number;
-    cache_read?: number;
-    cache_write?: number;
-  };
+  modalities: { input: string[]; output: string[] };
+  limit: { context: number; output: number; input?: number };
   status?: string;
   reasoning_options?: Array<
     | { type: "toggle" }
     | { type: "effort"; values: string[] }
+    | { type: "budget_tokens"; min?: number; max?: number }
   >;
 }
-
 export interface CatalogEntry {
   id: string;
   name: string;
@@ -51,197 +30,161 @@ export interface CatalogEntry {
   doc?: string;
   models: Record<string, CatalogModel>;
 }
-
 export type Catalog = Record<string, CatalogEntry>;
 
-// ---------------------------------------------------------------------------
-// Known base URLs for SDK-managed providers (no `api` field in models.dev)
-// ---------------------------------------------------------------------------
-
-const SDK_BASE_URLS: Record<string, { url: string; type: ProviderType }> = {
-  openai:                    { url: "https://api.openai.com/v1",              type: "openai" },
-  anthropic:                 { url: "https://api.anthropic.com",              type: "anthropic" },
-  google:                    { url: "https://generativelanguage.googleapis.com", type: "google-genai" },
-  google_vertex:             { url: "https://aiplatform.googleapis.com",      type: "vertexai" },
-  google_vertex_anthropic:   { url: "https://aiplatform.googleapis.com",      type: "vertexai" },
-  mistral:                   { url: "https://api.mistral.ai/v1",             type: "openai" },
-  xai:                       { url: "https://api.x.ai/v1",                  type: "openai" },
-  groq:                      { url: "https://api.groq.com/openai/v1",        type: "openai" },
-  cerebras:                  { url: "https://api.cerebras.ai/v1",            type: "openai" },
-  deepinfra:                 { url: "https://api.deepinfra.com/v1/openai",   type: "openai" },
-  togetherai:                { url: "https://api.together.xyz/v1",           type: "openai" },
-  perplexity:                { url: "https://api.perplexity.ai",             type: "openai" },
-  cohere:                    { url: "https://api.cohere.com/v2",             type: "openai" },
-  github_copilot:            { url: "https://api.githubcopilot.com",         type: "openai" },
-  github_models:             { url: "https://models.github.ai/inference",    type: "openai" },
+const NATIVE_PROVIDERS: Record<string, { url: string; type: ProviderType }> = {
+  openai: { url: "https://api.openai.com/v1", type: "openai" },
+  anthropic: { url: "https://api.anthropic.com", type: "anthropic" },
+  google: { url: "https://generativelanguage.googleapis.com", type: "google-genai" },
+  "google-vertex": { url: "https://aiplatform.googleapis.com", type: "vertexai" },
+  minimax: { url: "https://api.minimax.io/anthropic/v1", type: "anthropic" },
+  "kimi-for-coding": { url: "https://api.kimi.com/coding/v1", type: "anthropic" },
 };
 
-// ---------------------------------------------------------------------------
-// Infer provider type from catalog entry
-// ---------------------------------------------------------------------------
+/** Audited OpenAI Chat Completions endpoints for protocols Helix implements. */
+const OPENAI_WIRE_ENDPOINTS: Record<string, string> = {
+  "moonshotai-cn": "https://api.moonshot.cn/v1",
+  moonshotai: "https://api.moonshot.ai/v1",
+  deepseek: "https://api.deepseek.com",
+  "siliconflow-cn": "https://api.siliconflow.cn/v1",
+  siliconflow: "https://api.siliconflow.com/v1",
+  "alibaba-cn": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  zhipuai: "https://open.bigmodel.cn/api/paas/v4",
+  "fireworks-ai": "https://api.fireworks.ai/inference/v1",
+  mistral: "https://api.mistral.ai/v1",
+  groq: "https://api.groq.com/openai/v1",
+  xai: "https://api.x.ai/v1",
+  togetherai: "https://api.together.xyz/v1",
+  openrouter: "https://openrouter.ai/api/v1",
+  perplexity: "https://api.perplexity.ai",
+  deepinfra: "https://api.deepinfra.com/v1/openai",
+  cerebras: "https://api.cerebras.ai/v1",
+};
 
 export function inferProviderType(entry: CatalogEntry): ProviderType | undefined {
-  // Explicit SDK-managed providers
-  const sdkKey = entry.id.replace(/-/g, "_");
-  if (SDK_BASE_URLS[sdkKey]) return SDK_BASE_URLS[sdkKey].type;
+  if (entry.id === "google-vertex-anthropic") return undefined;
+  const native = NATIVE_PROVIDERS[entry.id];
+  if (native) return native.type;
+  if (!OPENAI_WIRE_ENDPOINTS[entry.id]) return undefined;
+  // Bearer-key OpenAI connections cannot represent templated endpoints or
+  // multiple structured credential fields.
+  if (entry.api?.includes("${") || (entry.env?.length ?? 0) > 1) return undefined;
+  return "openai";
+}
 
-  // If it has an `api` field, it's OpenAI-compatible
-  if (entry.api) return "openai";
+export function catalogBaseUrl(entry: CatalogEntry, _type: ProviderType): string {
+  return NATIVE_PROVIDERS[entry.id]?.url ?? OPENAI_WIRE_ENDPOINTS[entry.id] ?? "";
+}
 
-  // Check npm field for clues
-  if (entry.npm?.includes("anthropic")) return "anthropic";
-  if (entry.npm?.includes("google")) return "google-genai";
+export function isAdaptiveClaudeModel(modelId: string): boolean {
+  const match = modelId.toLowerCase().match(/(?:claude-)?(?:opus|sonnet|haiku)[-_ ]?(\d+)[-_.](\d+)(?:\D|$)/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 4 || (major === 4 && minor >= 6);
+}
 
-  // Default: assume OpenAI-compatible if there's an api field
+export type MoonshotReasoningMode = "k3" | "always" | "toggle";
+export function moonshotReasoningMode(modelId: string): MoonshotReasoningMode | undefined {
+  const id = modelId.toLowerCase();
+  if (/(?:^|[-_])(?:kimi-)?k3(?:$|[-_.])/.test(id)) return "k3";
+  if (/(?:^|[-_])(?:kimi-)?k2[._-]?7(?:$|[-_.])/.test(id)) return "always";
+  if (/(?:^|[-_])(?:kimi-)?k2[._-]?(?:5|6)(?:$|[-_.])/.test(id)) return "toggle";
   return undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Derive base URL for a catalog entry
-// ---------------------------------------------------------------------------
-
-export function catalogBaseUrl(entry: CatalogEntry, type: ProviderType): string {
-  // SDK-managed: use known URL
-  const sdkKey = entry.id.replace(/-/g, "_");
-  if (SDK_BASE_URLS[sdkKey]) return SDK_BASE_URLS[sdkKey].url;
-
-  // Has explicit api field
-  if (entry.api) return entry.api;
-
-  // Fallback
-  return "";
+export function deriveReasoningCapability(providerId: string, model: CatalogModel): ReasoningCapability {
+  if (!model.reasoning) return { availability: "none", persistence: "none" };
+  if (providerId === "anthropic" && !isAdaptiveClaudeModel(model.id)) {
+    return { availability: "none", persistence: "none" };
+  }
+  // These providers share Anthropic wire framing, but Helix has no authoritative
+  // toggle/effort mapping for them. Do not send Claude-specific controls.
+  if (providerId === "kimi-for-coding" || providerId === "minimax") {
+    return { availability: "always", persistence: "none" };
+  }
+  const catalogEffort = model.reasoning_options?.find((option): option is { type: "effort"; values: string[] } => option.type === "effort")?.values;
+  if (providerId === "moonshotai" || providerId === "moonshotai-cn") {
+    const mode = moonshotReasoningMode(model.id);
+    if (mode === "k3") return { availability: "always", persistence: "required", effort: catalogEffort?.length ? [...catalogEffort] : undefined };
+    if (mode === "always") return { availability: "always", persistence: "required" };
+    if (mode === "toggle") return { availability: "toggle", persistence: "none" };
+  }
+  const availability = model.reasoning_options?.some((option) => option.type === "toggle") ? "toggle" : "always";
+  return { availability, persistence: "none", effort: catalogEffort?.length ? [...catalogEffort] : undefined };
 }
-
-// ---------------------------------------------------------------------------
-// Extract models as ModelDef[]
-// ---------------------------------------------------------------------------
 
 export function catalogModels(entry: CatalogEntry): ModelDef[] {
   return Object.values(entry.models)
-    .filter((m) => !m.status || m.status !== "deprecated")
-    .map((m) => ({
-      id: m.id,
-      label: m.name || m.id,
-      description: buildModelDescription(m),
-      reasoning: m.reasoning,
+    .filter((model) => !model.status || model.status !== "deprecated")
+    .filter((model) => entry.id !== "google-vertex" || (!model.id.toLowerCase().startsWith("claude-") && !model.family?.toLowerCase().startsWith("claude")))
+    .map((model) => ({
+      id: model.id,
+      label: model.name || model.id,
+      description: buildDescription(model),
+      reasoning: deriveReasoningCapability(entry.id, model),
+      reasoningKnown: true,
+      context: model.limit?.context,
+      output: model.limit?.output,
     }));
 }
 
-function buildModelDescription(m: CatalogModel): string {
+function buildDescription(model: CatalogModel): string {
   const parts: string[] = [];
-  if (m.reasoning) parts.push("thinking");
-  if (m.tool_call) parts.push("tools");
-  if (m.attachment) parts.push("vision");
-  if (m.limit?.context) {
-    const ctx = m.limit.context;
-    parts.push(ctx >= 1_000_000 ? `${(ctx / 1_000_000).toFixed(0)}M ctx` : `${(ctx / 1000).toFixed(0)}K ctx`);
+  if (model.reasoning) parts.push("thinking");
+  if (model.attachment) parts.push("vision");
+  if (model.limit?.context) {
+    const context = model.limit.context;
+    parts.push(context >= 1_000_000 ? `${context / 1_000_000}M ctx` : `${Math.round(context / 1000)}K ctx`);
   }
   return parts.join(" · ");
 }
 
-// ---------------------------------------------------------------------------
-// Catalog fetching with disk cache
-// ---------------------------------------------------------------------------
-
 const CATALOG_URL = "https://models.dev/api.json";
-const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
-
-function cachePath(): string {
-  return path.join(os.homedir(), ".helix", "catalog_cache.json");
+const TTL = 60 * 60 * 1000;
+let refreshInFlight: Promise<Map<string, CatalogEntry>> | null = null;
+function cachePath(): string { return path.join(os.homedir(), ".helix", "catalog_cache.json"); }
+function loadDisk(): { data: Catalog; timestamp: number } | null {
+  try { return JSON.parse(fs.readFileSync(cachePath(), "utf-8")); } catch { return null; }
 }
-
-function ensureConfigDir(): void {
-  const dir = path.join(os.homedir(), ".helix");
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+function saveDisk(data: Catalog): void {
+  fs.mkdirSync(path.dirname(cachePath()), { recursive: true });
+  fs.writeFileSync(cachePath(), JSON.stringify({ data, timestamp: Date.now() }), { encoding: "utf-8", mode: 0o600 });
+  fs.chmodSync(cachePath(), 0o600);
 }
-
-function loadCacheFromDisk(): { data: Catalog; timestamp: number } | null {
-  const file = cachePath();
-  if (!fs.existsSync(file)) return null;
-  try {
-    const raw = fs.readFileSync(file, "utf-8");
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+export function sortCatalog(data: Catalog): Map<string, CatalogEntry> {
+  return new Map(Object.entries(data)
+    .filter(([, entry]) => inferProviderType(entry) !== undefined)
+    .sort(([, a], [, b]) => (a.name || a.id).localeCompare(b.name || b.id)));
 }
-
-function saveCacheToDisk(data: Catalog): void {
-  ensureConfigDir();
-  const file = cachePath();
-  const payload = JSON.stringify({ data, timestamp: Date.now() });
-  fs.writeFileSync(file, payload, "utf-8");
-  fs.chmodSync(file, 0o600);
+async function refreshCatalog(signal?: AbortSignal): Promise<Map<string, CatalogEntry>> {
+  const response = await fetch(CATALOG_URL, { signal, headers: { "User-Agent": "HelixCLI/1.5" } });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json() as Catalog;
+  saveDisk(data);
+  return sortCatalog(data);
 }
-
-/**
- * Fetch the provider catalog from models.dev.
- * Returns a Map of provider ID → CatalogEntry, sorted by name.
- * Uses disk cache with 1-hour TTL; falls back to cache on network error.
- */
 export async function fetchCatalog(signal?: AbortSignal): Promise<Map<string, CatalogEntry>> {
-  // Try network first
-  try {
-    const res = await fetch(CATALOG_URL, {
-      signal,
-      headers: { "User-Agent": "HelixCLI/1.0" },
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = (await res.json()) as Catalog;
-    saveCacheToDisk(data);
-    return sortCatalog(data);
-  } catch {
-    // Network failed — try disk cache
-    const cached = loadCacheFromDisk();
-    if (cached) return sortCatalog(cached.data);
-    return new Map();
+  const cached = loadDisk();
+  if (cached && Date.now() - cached.timestamp < TTL) return sortCatalog(cached.data);
+  if (cached) {
+    if (!refreshInFlight) refreshInFlight = refreshCatalog().finally(() => { refreshInFlight = null; });
+    void refreshInFlight.catch(() => {});
+    return sortCatalog(cached.data);
   }
+  if (!refreshInFlight) refreshInFlight = refreshCatalog(signal).finally(() => { refreshInFlight = null; });
+  try { return await refreshInFlight; } catch { return new Map(); }
 }
-
-/**
- * Load catalog from disk cache only (no network).
- * Returns empty map if no cache exists.
- */
 export function loadCatalogFromCache(): Map<string, CatalogEntry> {
-  const cached = loadCacheFromDisk();
-  if (!cached) return new Map();
-  // Check TTL
-  if (Date.now() - cached.timestamp > CACHE_TTL_MS) return new Map();
-  return sortCatalog(cached.data);
+  const cached = loadDisk();
+  return cached ? sortCatalog(cached.data) : new Map();
 }
-
-function sortCatalog(data: Catalog): Map<string, CatalogEntry> {
-  const entries = Object.entries(data)
-    .filter(([, e]) => {
-      // Only include providers we can handle
-      const type = inferProviderType(e);
-      return type !== undefined;
-    })
-    .sort(([, a], [, b]) => (a.name || a.id).localeCompare(b.name || b.id));
-  return new Map(entries);
-}
-
-/**
- * Pre-populate model cache from catalog disk cache.
- * This runs at startup so /model has models ready before network fetch.
- * Returns the model data keyed by provider ID.
- */
 export async function preloadCatalogModels(): Promise<Map<string, ModelDef[]>> {
   const result = new Map<string, ModelDef[]>();
-  const cached = loadCacheFromDisk();
-  if (!cached) return result;
-
-  for (const [id, entry] of Object.entries(cached.data)) {
-    const type = inferProviderType(entry);
-    if (!type) continue;
+  for (const [id, entry] of loadCatalogFromCache()) {
     const models = catalogModels(entry);
-    if (models.length > 0) {
-      result.set(id, models);
-    }
+    if (models.length) result.set(id, models);
   }
-
-  // Trigger network refresh in background (fire-and-forget)
-  fetchCatalog().catch(() => {});
-
+  void fetchCatalog().catch(() => {});
   return result;
 }
