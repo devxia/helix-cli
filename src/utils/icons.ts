@@ -1,35 +1,28 @@
-/**
- * Shared provider icon map used across the TUI.
- */
-
 export function providerIcon(providerId: string): string {
-  const iconMap: Record<string, string> = {
-    kimi: "🌙",
-    "kimi-code": "💻",
-    "moonshot-cn": "🌙",
-    "moonshot-ai": "🌙",
+  const icons: Record<string, string> = {
+    "moonshotai-cn": "🌙",
+    moonshotai: "🌙",
+    "kimi-for-coding": "💻",
     openai: "⚡",
     anthropic: "◈",
-    "google-genai": "🔷",
-    vertexai: "🔷",
+    google: "🔷",
+    "google-vertex": "🔷",
     deepseek: "🔮",
-    qwen: "🧩",
+    "alibaba-cn": "🧩",
     siliconflow: "🌊",
-    volcengine: "🌋",
-    zhipu: "🔮",
+    "siliconflow-cn": "🌊",
+    zhipuai: "🔮",
     minimax: "🎯",
-    yi: "✨",
-    baichuan: "🏔️",
     mistral: "🌀",
     groq: "⚡",
     xai: "✖",
     togetherai: "🤝",
-    fireworks: "🎆",
+    "fireworks-ai": "🎆",
     openrouter: "🔀",
     perplexity: "🔍",
     cohere: "🔷",
     deepinfra: "🏗️",
     cerebras: "🧠",
   };
-  return iconMap[providerId] ?? "⚡";
+  return icons[providerId] ?? "⚡";
 }

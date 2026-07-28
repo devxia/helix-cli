@@ -15,17 +15,14 @@ import {
   type ProviderConfig,
   type ModelDef,
   addCustomProvider,
+  configureCatalogProvider,
   listProviders,
   removeProvider,
   setProvider,
-  setProviderModels,
-  getActiveModel,
+  setCatalogProviderModels,
   setActiveModel,
-  isThinkingEnabled,
-  setThinkingEnabled,
   loadConfig,
-  hasApiKey,
-  resolveApiKey,
+  hasCredentials,
 } from "../config.js";
 import {
   type CatalogEntry,
@@ -86,6 +83,7 @@ class ProviderCommandUI implements Component, Focusable {
   private selectedBaseUrl = "";
   private selectedType: ProviderType = "openai";
   private selectedModels: ModelDef[] = [];
+  private selectedCatalogEntry: CatalogEntry | null = null;
 
   // Custom provider state
   private customName = "";
@@ -138,6 +136,8 @@ class ProviderCommandUI implements Component, Focusable {
         this.catalogSearch = "";
         this.rebuildCatalogList();
       } else {
+        this.selectedCatalogEntry = null;
+        this.selectedModels = [];
         this.phase = "custom-name";
         this.customNameInput.setValue("");
       }
@@ -159,6 +159,7 @@ class ProviderCommandUI implements Component, Focusable {
     // API key input
     this.apiKeyInput = new Input();
     this.apiKeyInput.onSubmit = (key) => {
+      if (this.selectedType === "vertexai") return;
       const trimmed = key.trim();
       if (!trimmed) return;
       this.applyProvider(trimmed);
@@ -172,7 +173,7 @@ class ProviderCommandUI implements Component, Focusable {
     this.modelList = new SelectList([], 12, selectTheme, selectLayout);
     this.modelList.onSelect = (item) => {
       setActiveModel(item.value);
-      this.ctx.addSystemMessage(
+      this.ctx.addNotice(
         `${GREEN}Model set to ${item.label}.${RESET}`,
       );
       this.ctx.applyProvider();
@@ -246,7 +247,7 @@ class ProviderCommandUI implements Component, Focusable {
         safeId = `custom-${Date.now()}`;
       }
       addCustomProvider(safeId, this.customName, this.customType, this.customBaseUrl, trimmed);
-      this.ctx.addSystemMessage(
+      this.ctx.addNotice(
         `${GREEN}Custom provider "${this.customName}" added and activated.${RESET}`,
       );
       this.ctx.applyProvider();
@@ -326,10 +327,10 @@ class ProviderCommandUI implements Component, Focusable {
     const config = loadConfig();
     const items: SelectItem[] = providers.map((p) => {
       const isActive = p.id === config.active_provider;
-      const hasKey = !!resolveApiKey(p.id, p).length;
+      const hasKey = hasCredentials(p);
       const icon = providerIcon(p.id);
       const keyHint = hasKey ? `${GREEN}key ✓${RESET}` : `${YELLOW}no key${RESET}`;
-      const activeMark = isActive && hasKey ? `${GREEN}active${RESET}` : "";
+        const activeMark = isActive && hasKey ? `${GREEN}active${RESET}` : "";
       const parts = [keyHint];
       if (activeMark) parts.push(activeMark);
       return {
@@ -361,6 +362,12 @@ class ProviderCommandUI implements Component, Focusable {
     if (provider) {
       this.selectedBaseUrl = provider.base_url;
       this.selectedType = provider.type;
+      this.selectedCatalogEntry = null;
+      this.selectedModels = [];
+      if (hasCredentials(provider)) {
+        this.applyProvider(provider.api_key);
+        return;
+      }
     }
     this.phase = "api-key";
     this.apiKeyReturnPhase = "manager";
@@ -382,7 +389,20 @@ class ProviderCommandUI implements Component, Focusable {
     this.selectedBaseUrl = catalogBaseUrl(entry, type);
     this.selectedType = type;
     this.selectedModels = catalogModels(entry);
+    this.selectedCatalogEntry = entry;
 
+    const candidate: ProviderConfig = {
+      name: this.selectedProviderName,
+      type,
+      source: "catalog",
+      base_url: this.selectedBaseUrl,
+      api_key: "",
+      env: [...(entry.env ?? [])],
+    };
+    if (hasCredentials(candidate)) {
+      this.applyProvider("");
+      return;
+    }
     this.phase = "api-key";
     this.apiKeyReturnPhase = "catalog-list";
     this.apiKeyInput.setValue("");
@@ -395,23 +415,21 @@ class ProviderCommandUI implements Component, Focusable {
     const existing = loadConfig().providers[this.selectedProviderId];
     if (existing) {
       setProvider(this.selectedProviderId, apiKey);
-      // setProvider only touches config; persist models separately.
-      if (this.selectedModels.length > 0) {
-        setProviderModels(this.selectedProviderId, this.selectedModels);
-      }
-    } else {
-      // addCustomProvider already persists models when provided.
-      addCustomProvider(
+      if (this.selectedModels.length > 0) setCatalogProviderModels(this.selectedProviderId, this.selectedModels);
+    } else if (this.selectedCatalogEntry) {
+      configureCatalogProvider(
         this.selectedProviderId,
-        this.selectedProviderName,
+        this.selectedCatalogEntry,
         this.selectedType,
         this.selectedBaseUrl,
         apiKey,
-        this.selectedModels.length > 0 ? this.selectedModels : undefined,
+        this.selectedModels,
       );
+    } else {
+      addCustomProvider(this.selectedProviderId, this.selectedProviderName, this.selectedType, this.selectedBaseUrl, apiKey, this.selectedModels);
     }
 
-    this.ctx.addSystemMessage(
+    this.ctx.addNotice(
       `${GREEN}Provider set to ${providerIcon(this.selectedProviderId)} ${this.selectedProviderName}.${RESET}`,
     );
 
@@ -425,7 +443,7 @@ class ProviderCommandUI implements Component, Focusable {
       this.modelList = new SelectList(modelItems, 12, selectTheme, selectLayout);
       this.modelList.onSelect = (mi) => {
         setActiveModel(mi.value);
-        this.ctx.addSystemMessage(`${GREEN}Model set to ${mi.label}.${RESET}`);
+        this.ctx.addNotice(`${GREEN}Model set to ${mi.label}.${RESET}`);
         this.ctx.applyProvider();
         this.ctx.done();
       };
@@ -523,10 +541,21 @@ class ProviderCommandUI implements Component, Focusable {
   private renderApiKey(width: number): string[] {
     const lines = this.apiKeyInput.render(width);
     const icon = providerIcon(this.selectedProviderId);
+    if (this.selectedType === "vertexai") {
+      return [
+        "",
+        ` ${icon} ${BOLD}${this.selectedProviderName}${RESET}`,
+        ` ${YELLOW}Set GOOGLE_VERTEX_PROJECT and GOOGLE_VERTEX_LOCATION, then reopen /provider.${RESET}`,
+        ` ${DIM}Authentication uses Google ADC; GOOGLE_APPLICATION_CREDENTIALS is optional when ADC is available another way.${RESET}`,
+        "",
+        ` ${DIM}Esc back${RESET}`,
+      ];
+    }
+    const declared = this.selectedCatalogEntry?.env?.join(" / ");
     return [
       "",
       ` ${icon} ${BOLD}${this.selectedProviderName}${RESET}`,
-      ` ${DIM}Enter your API key${RESET}`,
+      ` ${DIM}Enter your API key${declared ? ` (or set ${declared})` : ""}${RESET}`,
       ...lines,
       "",
       ` ${DIM}↵ confirm · Esc back${RESET}`,
@@ -600,7 +629,7 @@ class ProviderCommandUI implements Component, Focusable {
     if (this.deleteTarget !== null) {
       if (data === "y" || data === "Y") {
         removeProvider(this.deleteTarget);
-        this.ctx.addSystemMessage(`${YELLOW}Provider "${this.deleteTarget}" removed.${RESET}`);
+        this.ctx.addNotice(`${YELLOW}Provider "${this.deleteTarget}" removed.${RESET}`);
         this.deleteTarget = null;
         this.rebuildManagerList();
         this.ctx.showComponent(this);
