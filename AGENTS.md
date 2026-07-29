@@ -42,7 +42,7 @@ Repository-level Agent Guide
 
 ```text
 install.sh                 — 唯一用户安装入口；固定 Release、校验 SHA-256、配置 PATH
-scripts/release.sh         — 维护者本地交叉构建四个平台并创建 GitHub Release
+scripts/release.sh         — 维护者本地交叉构建四个平台并创建 GitHub Release；产物在 release/dist/（已 gitignore）
 src/
   main.ts                    — 参数解析；在导入 Pi 前准备隔离运行环境
   app.ts                     — System Prompt、资源策略与 Pi runtime/InteractiveMode 组合
@@ -92,6 +92,7 @@ CONTEXT.md                   — 纯领域术语表，不写实现方案
 - 默认新建持久 Session，可在 TUI 内显式恢复；
 - CLI 仅支持交互模式、`--help`、`--version`、`update`；
 - 安装与升级支持 macOS/Linux 的 arm64/x64，使用 GitHub stable Release 与 `checksums.txt`；
+- `install.sh` 支持 `--version` 与 `HELIX_VERSION`/`HELIX_INSTALL_DIR`/`HELIX_NO_MODIFY_PATH`；
 - 每次交互式启动最多异步检查一次 Update Notice，可用 `HELIX_NO_UPDATE_NOTICE=1` 禁用。
 
 不要提前实现筛选、查找、BED/GTF、区间提取、格式转换、SAM/CRAM/VCF 或任意命令代理。
@@ -128,6 +129,13 @@ bun build --compile --outfile helix src/main.ts
 5. `install.sh`、`scripts/release.sh` 语法检查及 mock Release 更新测试通过；
 6. `git diff --check` 通过；
 7. 工作区没有测试生成的凭证、工具、Session、`.pi-subagents` 或其他 delegation artifact。
+
+## 发布
+
+- 版本号必须三处一致：`package.json`、`src/paths.ts` 的 `HELIX_VERSION`、发布 tag `v<x.y.z>`。
+- 发布由维护者在本地执行 `./scripts/release.sh <x.y.z>`：校验版本一致、工作区干净、`main` 与 `origin/main` 同步，交叉构建四个平台，生成 `checksums.txt`，打 tag 并用 `gh` 创建 stable Release。没有 CI 发布流水线。
+- 发布信任与更新边界见本地 ADR 0004。
+- 首个公开 Release 为 v0.2.1。推送后 raw.githubusercontent.com 的 `install.sh` 有约 5 分钟 CDN 缓存，验证线上安装时需等待或加 cache-buster。
 
 ## 上游 Pi 升级
 
