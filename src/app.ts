@@ -18,6 +18,7 @@ import { createDelegateTool } from "./delegate/tool.js";
 import type { SpecialistLauncher } from "./delegate/types.js";
 import type { HelixPaths } from "./paths.js";
 import { SeqkitManager } from "./seqkit/manager.js";
+import { createUpdateNoticeExtension } from "./update/notice.js";
 import { HelixSettingsStorage } from "./settings-storage.js";
 import { createSeqkitTools } from "./seqkit/tools.js";
 
@@ -76,6 +77,7 @@ export async function runHelixApp(options: RunHelixAppOptions): Promise<void> {
       modelRuntime,
       resourceLoaderOptions: {
         noExtensions: true,
+        extensionFactories: [createUpdateNoticeExtension()],
         noSkills: true,
         noPromptTemplates: true,
         noThemes: true,

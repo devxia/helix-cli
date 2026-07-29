@@ -36,6 +36,34 @@ _Avoid_: Tool Run、Delegation Run、Helix Session
 用户针对一个含 Development Worker 的 Delegation Run 明确授予的临时开发权限；该权限不会延续到下一次编排。
 _Avoid_: 项目授权、永久信任、只读确认
 
+**Release Publication**:
+维护者将一个已验证 Release 及其平台二进制公开给用户的行为；Helix 的首个发布过程由本地脚本在维护者机器上执行，并要求发布版本标识一致。
+_Avoid_: Release、CI 发布、自动版本提升
+
+**Update Verification**:
+Helix 在替换已安装二进制前，确认所选 Release、目标平台、二进制校验和及新二进制可执行版本的检查过程。
+_Avoid_: Tool Run、Provenance、自动信任
+
+**Update Notice**:
+交互式启动时向用户展示的可忽略的 Upgrade 提示；它不会改变当前版本或自动触发 Upgrade。
+_Avoid_: Self Update、后台更新、Release 检查命令
+
+**Release**:
+一个已验证的 Helix 版本及其针对各支持平台分发的校验后二进制。
+_Avoid_: Git 标签、包发布、未验证构建
+
+**Self Update**:
+已安装 Helix 通过公开升级命令执行 Upgrade 的原地替换形式。
+_Avoid_: Installation、自动后台更新、Managed Tool 更新
+
+**Upgrade**:
+使用同一路径上的校验后 Helix 二进制替换当前已安装版本的维护行为；默认目标是稳定的最新版本。
+_Avoid_: Installation、Self Update、自动后台更新
+
+**Installation**:
+用户将当前发布的 Helix 二进制放置到 PATH 可发现位置的首次分发行为；安装脚本可以配置用户的 shell PATH。
+_Avoid_: Upgrade、Self Update、首次启动
+
 **Agent Tool**:
 Helix Agent 可选择的一项具有明确输入和结果契约的确定性能力。
 _Avoid_: shell 命令、任意命令代理、外部程序

@@ -10,7 +10,7 @@ Repository-level Agent Guide
 
 **领域能力优先于基础设施重造。** Provider、模型、Thinking、Session 和交互式 TUI 由嵌入的 Pi SDK 提供。Helix 的代码集中在生物信息学工具、科研工作流、安全边界和结果解释。
 
-**零感知安装。** 最终用户只下载 `helix`。Pi SDK 编译进 Helix；必要的私有运行资源和 Managed Tool 只能写入 `~/.helix`，不得要求用户安装 Node、Bun、TypeScript 或全局 Pi。
+**零感知安装。** 最终用户通过固定 Release 的 `install.sh` 下载一个校验后的 `helix`。Pi SDK 编译进 Helix；必要的私有运行资源和 Managed Tool 只能写入 `~/.helix`，不得要求用户安装 Node、Bun、TypeScript 或全局 Pi。
 
 ## 技术约束
 
@@ -21,7 +21,7 @@ Repository-level Agent Guide
 | Agent Tool Schema | Pi 当前公开 Schema 包 `typebox`；领域结果使用 TypeScript 类型 |
 | 子进程 | `Bun.spawn()` 直接 argv；科研工具禁止 shell 拼接；并发读取 stdout/stderr；支持 AbortSignal；Specialist 使用同一 Helix 二进制和私有 stdin/stdout JSON 协议 |
 | 生物信息学工具 | PATH 中经版本验证的程序，或固定 URL/SHA-256 的 Managed Tool |
-| 分发 | `bun build --compile` 生成一个 `helix` 二进制 |
+| 分发 | `bun build --compile` 生成一个 `helix` 二进制；`install.sh` 与 `helix update` 只信任 devxia/helix-cli GitHub Release 的 SHA-256 校验资产 |
 | 测试 | `bun:test`；默认测试离线且只使用临时 HOME/目录；真实工具另设集成测试 |
 
 除 Specialist Agent（本地 ADR 0003）外，未经 ADR 不引入新的 Agent loop、LLM Provider 抽象或 TUI。不要引入 Web、MCP Server、数据库服务、容器平台或分布式队列。
@@ -41,10 +41,16 @@ Repository-level Agent Guide
 ## 当前项目地图（0.2.1）
 
 ```text
+install.sh                 — 唯一用户安装入口；固定 Release、校验 SHA-256、配置 PATH
+scripts/release.sh         — 维护者本地交叉构建四个平台并创建 GitHub Release
 src/
   main.ts                    — 参数解析；在导入 Pi 前准备隔离运行环境
   app.ts                     — System Prompt、资源策略与 Pi runtime/InteractiveMode 组合
   paths.ts                   — ~/.helix、项目 .helix 与 session 路径
+  update/
+    core.ts                  — 平台、semver、Release 资产与 checksums 解析
+    update.ts                — helix update 的下载、校验与原子替换
+    notice.ts                — 每次交互启动一次的公开 Pi Update Notice extension
   runtime-assets.ts          — 物化内嵌的 Helix 品牌与 Pi 运行资源
   settings-storage.ts        — 清除外部资源包与遥测的隔离 Settings 存储
   assets/pi/                 — 编译进 Helix 的 Pi 主题与 HTML 导出资源
@@ -84,7 +90,9 @@ CONTEXT.md                   — 纯领域术语表，不写实现方案
 - SeqKit PATH 版本范围 `>=2.13.0 <2.14.0`；托管回退固定为 2.13.0；
 - macOS/Linux 的 arm64/x64；
 - 默认新建持久 Session，可在 TUI 内显式恢复；
-- CLI 仅支持交互模式、`--help`、`--version`。
+- CLI 仅支持交互模式、`--help`、`--version`、`update`；
+- 安装与升级支持 macOS/Linux 的 arm64/x64，使用 GitHub stable Release 与 `checksums.txt`；
+- 每次交互式启动最多异步检查一次 Update Notice，可用 `HELIX_NO_UPDATE_NOTICE=1` 禁用。
 
 不要提前实现筛选、查找、BED/GTF、区间提取、格式转换、SAM/CRAM/VCF 或任意命令代理。
 
@@ -117,8 +125,9 @@ bun build --compile --outfile helix src/main.ts
 2. 真实 SeqKit 2.13.0 对 FASTA、FASTQ、BAM fixture 的集成测试通过；
 3. 类型检查通过；
 4. 单二进制编译及 `--version/--help` 烟测通过；
-5. `git diff --check` 通过；
-6. 工作区没有测试生成的凭证、工具、Session、`.pi-subagents` 或其他 delegation artifact。
+5. `install.sh`、`scripts/release.sh` 语法检查及 mock Release 更新测试通过；
+6. `git diff --check` 通过；
+7. 工作区没有测试生成的凭证、工具、Session、`.pi-subagents` 或其他 delegation artifact。
 
 ## 上游 Pi 升级
 
