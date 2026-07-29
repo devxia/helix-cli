@@ -140,8 +140,12 @@ update_path() {
   fi
 }
 
+HELIX_TMP=""
+cleanup() { [ -z "$HELIX_TMP" ] || rm -rf "$HELIX_TMP"; }
+trap cleanup EXIT
+
 main() {
-  local target version tag asset checksum_asset asset_url checksum_url expected actual tmp rc
+  local target version tag asset checksum_asset asset_url checksum_url expected actual rc
   parse_args "$@"
   target="$(detect_target)"
   asset="helix-$target"
@@ -163,23 +167,22 @@ main() {
   fi
   log "Installing Helix $version for $target"
 
-  tmp="$(mktemp -d 2>/dev/null || mktemp -d -t helix-install)"
-  trap 'rm -rf "$tmp"' EXIT
+  HELIX_TMP="$(mktemp -d 2>/dev/null || mktemp -d -t helix-install)"
   checksum_url="https://github.com/$REPO/releases/download/$tag/checksums.txt"
   asset_url="https://github.com/$REPO/releases/download/$tag/$asset"
   log "Downloading $asset"
   checksums="$(download "$checksum_url")" || fail "could not download checksums.txt"
   expected="$(checksum_for "$checksums" "$asset")"
-  download "$asset_url" "$tmp/$asset"
-  actual="$(sha256 "$tmp/$asset")"
+  download "$asset_url" "$HELIX_TMP/$asset"
+  actual="$(sha256 "$HELIX_TMP/$asset")"
   [ "$actual" = "$expected" ] || fail "checksum mismatch: expected $expected, got $actual"
 
-  chmod 0755 "$tmp/$asset"
-  installed_version="$($tmp/$asset --version)"
+  chmod 0755 "$HELIX_TMP/$asset"
+  installed_version="$($HELIX_TMP/$asset --version)"
   [ "$installed_version" = "helix $version" ] || fail "downloaded binary reported '$installed_version'"
 
   mkdir -p "$HELIX_INSTALL_DIR"
-  install -m 0755 "$tmp/$asset" "$HELIX_INSTALL_DIR/helix"
+  install -m 0755 "$HELIX_TMP/$asset" "$HELIX_INSTALL_DIR/helix"
   log "Installed $HELIX_INSTALL_DIR/helix"
   update_path
   log "Done. Run: helix --version"
