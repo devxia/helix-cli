@@ -30,3 +30,4 @@ temp/
 
 # Local architecture decisions
 docs/adr/
+release/
