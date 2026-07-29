@@ -1,8 +1,9 @@
 import { SPECIALIST_CHILD_ENV } from "./delegate/process.js";
 import { createHelixPaths, HELIX_VERSION } from "./paths.js";
+import { formatUpdateResult, runHelixUpdate } from "./update/update.js";
 import { configurePiEnvironment, preparePiRuntimeAssets } from "./runtime-assets.js";
 
-const HELP = `Helix CLI ${HELIX_VERSION}\n\nUsage:\n  helix             Start the interactive scientific agent\n  helix --help      Show this help\n  helix --version   Show the version\n\nHelix stores isolated settings, sessions, and managed tools under ~/.helix.\n`;
+const HELP = `Helix CLI ${HELIX_VERSION}\n\nUsage:\n  helix             Start the interactive scientific agent\n  helix --help      Show this help\n  helix --version   Show the version\n\n  helix update      Check the latest stable release and upgrade this binary\n\nHelix stores isolated settings, sessions, and managed tools under ~/.helix.\n`;
 
 export async function runCli(args = process.argv.slice(2)): Promise<number> {
   if (process.env[SPECIALIST_CHILD_ENV] === "1") {
@@ -14,6 +15,12 @@ export async function runCli(args = process.argv.slice(2)): Promise<number> {
     configurePiEnvironment(paths);
     const { runSpecialistChildProcess } = await import("./delegate/child.js");
     return runSpecialistChildProcess(paths);
+  }
+
+  if (args.length === 1 && args[0] === "update") {
+    const result = await runHelixUpdate();
+    process.stdout.write(formatUpdateResult(result));
+    return 0;
   }
 
   if (args.length === 1 && args[0] === "--version") {
