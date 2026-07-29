@@ -22,7 +22,7 @@ const PACKAGE_JSON = `${JSON.stringify(
   2,
 )}\n`;
 
-const CHANGELOG = `# Changelog\n\n## [${HELIX_VERSION}]\n\n- Embed the Pi Agent runtime.\n- Add controlled FASTX and BAM inspection with SeqKit.\n`;
+const CHANGELOG = `# Changelog\n\n## [${HELIX_VERSION}]\n\n- Embed the Pi Agent runtime.\n- Add controlled FASTX and BAM inspection with SeqKit.\n- Add foreground Specialist Agent delegation with fixed roles and isolated child sessions.\n`;
 
 async function writePrivateFile(path: string, content: string): Promise<void> {
   let current: string | undefined;
