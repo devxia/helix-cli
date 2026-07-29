@@ -1,0 +1,5 @@
+# Model providers in Helix
+
+Use `/login` in the Helix TUI to authenticate with a supported model provider by OAuth or API key. Helix stores credentials in `~/.helix/auth.json`; it never reads or writes Pi's `~/.pi` credentials.
+
+Existing provider environment variables remain available to the embedded runtime. Helix does not modify the process environment or PATH.

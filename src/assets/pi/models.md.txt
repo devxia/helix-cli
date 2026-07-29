@@ -1,0 +1,5 @@
+# Models in Helix
+
+Use `/model` in the Helix TUI to select an available model. Provider authentication is configured with `/login`.
+
+Helix stores custom model definitions in `~/.helix/models.json` and settings in `~/.helix/settings.json`. These files are isolated from any standalone Pi installation.

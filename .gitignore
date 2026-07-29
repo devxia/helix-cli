@@ -27,7 +27,3 @@ bun-debug.log*
 .tmp/
 temp/
 .cache/
-
-# Local docs / ADRs / context (not committed)
-docs/
-CONTEXT.md
