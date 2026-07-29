@@ -8,6 +8,34 @@ Helix 是面向科学与生物信息学工作的终端 Agent。本术语表区�
 在终端中理解科学问题、选择受控能力并解释结果的对话参与者。
 _Avoid_: 聊天客户端、Pi Agent、LLM
 
+**Specialist Agent**:
+由 Helix Agent 委派一个边界明确的任务、在独立上下文中工作的专业协作者；Helix Agent 仍对最终决策和结果整合负责。
+_Avoid_: Agent Tool、独立用户会话、自治编排器
+
+**Scientific Specialist**:
+面向科研分析、方案规划或结果复核且不能修改用户工作区的 Specialist Agent。
+_Avoid_: Development Worker、只读工具
+
+**Development Worker**:
+仅在用户明确授权代码变更后，才可以修改当前工作区的 Specialist Agent。
+_Avoid_: Scientific Specialist、默认写入者
+
+**Delegation**:
+Helix Agent 将一个任务及其权限边界交给 Specialist Agent，并接收结果用于当前对话的行为。
+_Avoid_: Tool Run、任务转移、放弃父级责任
+
+**Delegation Run**:
+一次前台 Delegation 编排；可以包含一个、多个并行或多个顺序执行的 Specialist Run，并具有明确的整体结果。
+_Avoid_: Tool Run、后台任务、用户会话
+
+**Specialist Run**:
+一个 Specialist Agent 在独立上下文中执行一个被委派任务的过程；它拥有独立结果与可追踪记录。
+_Avoid_: Tool Run、Delegation Run、Helix Session
+
+**Writer Authorization**:
+用户针对一个含 Development Worker 的 Delegation Run 明确授予的临时开发权限；该权限不会延续到下一次编排。
+_Avoid_: 项目授权、永久信任、只读确认
+
 **Agent Tool**:
 Helix Agent 可选择的一项具有明确输入和结果契约的确定性能力。
 _Avoid_: shell 命令、任意命令代理、外部程序

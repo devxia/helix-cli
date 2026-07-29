@@ -1,11 +1,23 @@
-import { createHelixPaths } from "./paths.js";
+import { SPECIALIST_CHILD_ENV } from "./delegate/process.js";
+import { createHelixPaths, HELIX_VERSION } from "./paths.js";
 import { configurePiEnvironment, preparePiRuntimeAssets } from "./runtime-assets.js";
 
-const HELP = `Helix CLI 0.1.0\n\nUsage:\n  helix             Start the interactive scientific agent\n  helix --help      Show this help\n  helix --version   Show the version\n\nHelix stores isolated settings, sessions, and managed tools under ~/.helix.\n`;
+const HELP = `Helix CLI ${HELIX_VERSION}\n\nUsage:\n  helix             Start the interactive scientific agent\n  helix --help      Show this help\n  helix --version   Show the version\n\nHelix stores isolated settings, sessions, and managed tools under ~/.helix.\n`;
 
 export async function runCli(args = process.argv.slice(2)): Promise<number> {
+  if (process.env[SPECIALIST_CHILD_ENV] === "1") {
+    if (args.length > 0) throw new Error("Specialist child mode does not accept command-line arguments");
+    delete process.env[SPECIALIST_CHILD_ENV];
+    const cwd = process.cwd();
+    const paths = createHelixPaths(cwd);
+    await preparePiRuntimeAssets(paths);
+    configurePiEnvironment(paths);
+    const { runSpecialistChildProcess } = await import("./delegate/child.js");
+    return runSpecialistChildProcess(paths);
+  }
+
   if (args.length === 1 && args[0] === "--version") {
-    process.stdout.write("helix 0.1.0\n");
+    process.stdout.write(`helix ${HELIX_VERSION}\n`);
     return 0;
   }
 

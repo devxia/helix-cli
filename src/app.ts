@@ -13,6 +13,9 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { launchSpecialistProcess } from "./delegate/process.js";
+import { createDelegateTool } from "./delegate/tool.js";
+import type { SpecialistLauncher } from "./delegate/types.js";
 import type { HelixPaths } from "./paths.js";
 import { SeqkitManager } from "./seqkit/manager.js";
 import { HelixSettingsStorage } from "./settings-storage.js";
@@ -22,6 +25,7 @@ export const HELIX_SYSTEM_PROMPT = `You are Helix, a scientific and bioinformati
 Answer directly in the user's language and distinguish observations from interpretation.
 Use only the tools actually provided. Never invent shell access, commands, files, tool results, or scientific evidence.
 Use read-only discovery tools to locate relevant local files. Use Helix bioinformatics tools for data processing and inspection.
+Delegate only when an independent Specialist Agent materially improves the result. Specialist outputs are advisory evidence: evaluate them and remain responsible for the final answer. Read-only Specialists may run automatically within fixed limits. A Development Worker requires the user's explicit authorization for each Delegation Run.
 Before a potentially long scan, tell the user what will be read. After a tool run, explain the result and cite the recorded executable version and input path when relevant.
 Do not claim that FASTA/FASTQ and BAM have the same semantics. SAM, CRAM, VCF, and unprovided operations are unsupported unless a future Agent Tool explicitly provides them.`;
 
@@ -45,7 +49,14 @@ export async function runHelixApp(options: RunHelixAppOptions): Promise<void> {
   });
   const seqkitManager = new SeqkitManager({ toolsDir: options.paths.toolsDir });
   const helixTools = createSeqkitTools(seqkitManager);
-  const toolNames = ["read", "grep", "find", "ls", ...helixTools.map((tool) => tool.name)];
+  const launchSpecialist: SpecialistLauncher = (request, launchOptions) => launchSpecialistProcess(
+    request,
+    launchOptions,
+    { env: { ...process.env, HELIX_HOME: options.paths.agentDir } },
+  );
+  const delegateTool = createDelegateTool({ launch: launchSpecialist });
+  const parentTools = [...helixTools, delegateTool];
+  const toolNames = ["read", "grep", "find", "ls", ...parentTools.map((tool) => tool.name)];
 
   const createRuntime: CreateAgentSessionRuntimeFactory = async ({
     cwd,
@@ -86,7 +97,7 @@ export async function runHelixApp(options: RunHelixAppOptions): Promise<void> {
       sessionManager,
       sessionStartEvent,
       tools: toolNames,
-      customTools: helixTools,
+      customTools: parentTools,
     });
     return { ...created, services, diagnostics: services.diagnostics };
   };

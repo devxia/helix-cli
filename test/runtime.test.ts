@@ -20,12 +20,13 @@ describe("isolated Helix runtime", () => {
     const paths = createHelixPaths(cwd, home);
     expect(Object.values(paths).every((path) => !path.includes("/.pi/"))).toBeTrue();
     expect(paths.projectDir).toBe(join(cwd, ".helix"));
+    expect(paths.subagentSessionDir).toBe(join(home, "sessions", "subagents"));
 
     await preparePiRuntimeAssets(paths);
     const packageJson = JSON.parse(await readFile(join(paths.runtimeDir, "package.json"), "utf8"));
     expect(packageJson).toMatchObject({
       name: "helix",
-      version: "0.1.0",
+      version: "0.2.1",
       piConfig: { name: "helix", configDir: ".helix" },
     });
     expect(JSON.parse(await readFile(join(paths.runtimeDir, "theme", "dark.json"), "utf8")).name).toBe("dark");

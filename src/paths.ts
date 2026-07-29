@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
-export const HELIX_VERSION = "0.1.0";
+export const HELIX_VERSION = "0.2.1";
 export const PI_VERSION = "0.82.1";
 
 export interface HelixPaths {
@@ -10,6 +10,7 @@ export interface HelixPaths {
   readonly projectDir: string;
   readonly runtimeDir: string;
   readonly sessionDir: string;
+  readonly subagentSessionDir: string;
   readonly toolsDir: string;
 }
 
@@ -28,6 +29,7 @@ export function createHelixPaths(cwd: string, agentDir = defaultHelixHome()): He
     projectDir: join(resolvedCwd, ".helix"),
     runtimeDir: join(resolvedAgentDir, "runtime", `helix-${HELIX_VERSION}-pi-${PI_VERSION}`),
     sessionDir: join(resolvedAgentDir, "sessions", `${cwdLabel}-${cwdHash}`),
+    subagentSessionDir: join(resolvedAgentDir, "sessions", "subagents"),
     toolsDir: join(resolvedAgentDir, "tools"),
   };
 }
