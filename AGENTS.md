@@ -1,171 +1,123 @@
-# AGENTS.md — Helix Cli
+# AGENTS.md — Helix CLI
 
 Repository-level Agent Guide
 
----
-
 ## 产品哲学
 
-**终端是科学家的工作环境。** Helix Cli 不是一个 Web 应用的终端 fallback，而是一个原生的终端 Agent。用户 SSH 到服务器，输入 `helix`，就能对话、提交分析、监控任务。不需要浏览器，不需要鼠标，不需要离开终端。
+**终端是科学家的工作环境。** 用户安装一个 `helix` 文件，在当前目录运行它即可对话、检查数据和逐步执行科研分析。
 
-**确定性工具层是可信度的根基。** LLM 不直接生成 shell 命令。LLM 选择工具，代码执行工具。每个工具有 Zod Schema 验证参数，每个执行路径可追踪、可回放。参考 Anthropic "Paving the way for agents in biology"：确定性检索层将准确率从"有时对"提升到"几乎永远对"。
+**确定性工具层是可信度的根基。** LLM 只能选择具有明确 Schema 的 Agent Tool；模型不得生成或透传 shell 字符串。外部程序由代码使用 argv 直接启动，每次执行都必须可中断并记录 Provenance。
 
-**零感知安装是分发的前提。** 用户通过 `curl | bash` 安装，不需要知道 Bun 存在，不需要知道 TypeScript 存在，不需要知道 pi-TUI 存在。用户下载一个文件，运行它。仅此而已。
+**领域能力优先于基础设施重造。** Provider、模型、Thinking、Session 和交互式 TUI 由嵌入的 Pi SDK 提供。Helix 的代码集中在生物信息学工具、科研工作流、安全边界和结果解释。
 
----
+**零感知安装。** 最终用户只下载 `helix`。Pi SDK 编译进 Helix；必要的私有运行资源和 Managed Tool 只能写入 `~/.helix`，不得要求用户安装 Node、Bun、TypeScript 或全局 Pi。
 
-## 技术约束（不可违背）
+## 技术约束
 
-| 层级 | 技术 | 替换条件 | 现状(v1) |
-|------|------|---------|---------|
-| 运行时 | Bun 1.2+ | 仅当 Bun 停止维护时可退至 Node.js + tsx | ✅ 已落地 |
-| TUI | pi-TUI (`@earendil-works/pi-tui`) | 仅当项目停止维护时可考虑 blessed | ✅ 已落地 |
-| Agent | LangGraph TS (`@langchain/langgraph`) | 不接受替换 | ⏳ 未引入 |
-| LLM SDK | OpenAI SDK (`openai` + base_url) 为主；Anthropic (`@anthropic-ai/sdk`)、Google GenAI (`@google/genai`) 用于原生协议 | 不接受替换 OpenAI SDK 的核心地位；新增原生 SDK 需经 ADR | ✅ 已落地 |
-| 数据 | bun:sqlite | 不接受替换 | ⏳ 未引入（暂用 `Bun.TOML` 读配置） |
-| 验证 | Zod | 不接受替换 | ✅ 已落地 |
-| 分发 | `bun build --compile` | 仅当 Bun 取消该功能时可退至 pkg | ✅ 已落地 |
+| 层级 | 技术与约束 |
+|---|---|
+| 运行时 | Bun 1.2+；开发与测试使用 Bun |
+| Agent/TUI | `@earendil-works/pi-coding-agent` SDK；只使用根包公开导出，不 fork、不使用深层 import |
+| Agent Tool Schema | Pi 当前公开 Schema 包 `typebox`；领域结果使用 TypeScript 类型 |
+| 子进程 | `Bun.spawn()` 直接 argv；禁止 shell 拼接；并发读取 stdout/stderr；支持 AbortSignal |
+| 生物信息学工具 | PATH 中经版本验证的程序，或固定 URL/SHA-256 的 Managed Tool |
+| 分发 | `bun build --compile` 生成一个 `helix` 二进制 |
+| 测试 | `bun:test`；默认测试离线且只使用临时 HOME/目录；真实工具另设集成测试 |
 
-**不在技术栈列表上的依赖不引入。** 不引入 PostgreSQL、Redis、Docker、FastAPI、Express、React（Web）、MCP Server 架构。Helix Cli 是单进程终端应用，不是分布式系统。
+未经 ADR 不引入第二套 Agent loop、LLM Provider 抽象或 TUI。不要引入 Web、MCP Server、数据库服务、容器平台或分布式队列来完成单进程首版能力。
 
----
+## 架构边界
 
-## 架构原则
+**Pi Runtime 是宿主。** `AgentSessionRuntime + InteractiveMode` 拥有聊天、模型、认证、Thinking、Session 和交互生命周期。Helix 通过公开 SDK 提供 System Prompt、允许的只读内置工具和自定义 Agent Tool。
 
-**命令式组件模型。** pi-TUI 不是 React。你创建组件用 `new`，添加子组件用 `addChild()`，管理焦点用 `setFocus()`，处理输入用 `addInputListener()` + `matchesKey()`。忘掉 JSX，忘掉 hooks，忘掉虚拟 DOM。
+**Helix 与 Pi 完全隔离。** Helix 使用 `~/.helix` 和项目 `.helix`，不得读写 `~/.pi` 或项目 `.pi`。可以读取进程已有的 Provider 环境变量和 PATH，但不得修改它们。外部 Pi Extensions 不加载；只允许 `.helix` 中的 Skills 和 Prompt Templates。
 
-**三层分离，事件总线连接。** TUI 层（pi-TUI）和 Agent 层（LangGraph）不直接调用对方。两者通过 `appState`（EventEmitter + bun:sqlite）通信：Agent 提交事件，TUI 监听刷新；TUI 提交命令，Agent 监听执行。这种解耦让 TUI 可以在 Agent 还在思考时保持 60fps。
+**最小权限。** Pi 内置工具仅启用 `read`、`grep`、`find`、`ls`。禁用 `bash`、`edit`、`write`。所有生物数据变换必须经过 Helix Agent Tool。
 
-**每个子进程都是流。** 所有生物信息学工具通过 `Bun.spawn()` 异步调用，stdout/stderr 通过 `for await` 实时流式传输到 TUI。不允许阻塞等待命令完成后再显示输出。用户在 BWA 比对 30 亿条 reads 时应该看到每一行的 SAM 头部实时闪过。
+**外部程序不是领域接口。** `inspect_fastx` 等 Agent Tool 表达科研意图；SeqKit 是实现该意图的外部程序。不要新增 `run_seqkit(args)` 一类透传接口。
 
----
+**大结果落盘。** 未来生成序列或图片的工具返回 Artifact 和摘要，不把完整大型输出写入模型上下文。输入可以位于任意可读路径；派生 Artifact 只能写入启动工作区，且不得静默覆盖。
+
+## 当前项目地图（0.1.0）
+
+```text
+src/
+  main.ts                    — 参数解析；在导入 Pi 前准备隔离运行环境
+  app.ts                     — System Prompt、资源策略与 Pi runtime/InteractiveMode 组合
+  paths.ts                   — ~/.helix、项目 .helix 与 session 路径
+  runtime-assets.ts          — 物化内嵌的 Helix 品牌与 Pi 运行资源
+  settings-storage.ts        — 清除外部资源包与遥测的隔离 Settings 存储
+  assets/pi/                 — 编译进 Helix 的 Pi 主题与 HTML 导出资源
+  executor/subprocess.ts     — 可中断、限量捕获的 Bun 子进程执行
+  seqkit/
+    manifest.ts              — SeqKit 2.13.0 平台资产与 SHA-256
+    archive.ts               — 防路径逃逸的单文件 tar.gz 提取
+    manager.ts               — PATH 解析、版本策略、确认和托管安装
+    parsers.ts               — FASTX/BAM TSV 解析
+    tools.ts                 — inspect_fastx / inspect_bam Agent Tool
+
+test/
+  fixtures/                  — 小型真实 FASTX/BAM 数据及来源说明
+  *.test.ts                  — 离线单元/契约测试
+  integration/               — 显式运行的真实 SeqKit 测试
+
+docs/adr/                    — 难以逆转的架构决策
+CONTEXT.md                   — 纯领域术语表，不写实现方案
+```
+
+## 当前功能边界
+
+0.1.0 只实现：
+
+- `inspect_fastx`：1–32 个 FASTA/FASTQ 文件，调用 `seqkit stats --all --tabular --quiet`；
+- `inspect_bam`：单个 BAM，调用 `seqkit bam -s --quiet`；
+- SeqKit PATH 版本范围 `>=2.13.0 <2.14.0`；托管回退固定为 2.13.0；
+- macOS/Linux 的 arm64/x64；
+- 默认新建持久 Session，可在 TUI 内显式恢复；
+- CLI 仅支持交互模式、`--help`、`--version`。
+
+不要提前实现筛选、查找、BED/GTF、区间提取、格式转换、SAM/CRAM/VCF 或任意命令代理。
 
 ## 开发原则
 
-**代码是唯一的真理。** 文档会过时，注释会撒谎，类型定义会漂移。实现细节以代码为准。修改前先读相关代码和最近的提交记录，不要盲目遵循文档。
+- 修改前读取完整相关模块、测试、最近提交和本目录最近的 `AGENTS.md`。
+- 每条变更必须追溯到当前目标；不顺手重构无关代码。
+- 工具参数和统计字段以固定版本官方文档及真实命令输出为准，不猜测。
+- 新工具先写失败/中断/路径/真实输出测试，再扩展功能面。
+- 测试不得修改真实 `~/.helix`、`~/.pi` 或用户 PATH 中的程序。
+- 下载必须固定 HTTPS 来源和 SHA-256，先校验压缩包，再防御性解包并校验可执行文件版本。
+- 非零退出、中断、输出截断或解析失败时不得返回部分统计为成功结果。
+- 代码注释只解释不明显的约束和原因，不复述语句。
 
-**先读后改。** 任何变更前，读取涉及的完整模块、相关的测试文件、以及目录下最近的 `AGENTS.md`。不理解代码的上下文就不动手。
-
-**变更聚焦。** 一个提交只做一件事。不在修复 bug 的 PR 里混入重构，不在添加工具的 PR 里修改 TUI 主题。如果改着改着发现"顺便可以优化一下"，记下来，另开一个任务。
-
-**递进式交付，不是瀑布式。** 遵循 `HelixCli_vibecoding_prompt.txt` 中的阶段定义。阶段 N 必须独立可运行、有明确的验收标准，才能进入阶段 N+1。不要提前实现下一阶段的功能。
-
-**生物信息学工具是生产力，不是演示品。** 每个工具封装必须能在真实数据上运行，不是 mock。工具参数的描述要精确到让生物信息学家知道该填什么。如果一个参数的含义你不确定，查该工具的官方文档，不要猜测。
-
----
-
-## 项目地图
-
-```
-src/
-  main.ts              — 入口。解析参数，启动 TUI，处理崩溃。
-  config.ts            — Zod 配置模型 + ~/.helix/config.json 读写。
-  state.ts             — EventEmitter + bun:sqlite。唯一的状态源。
-  db.ts                — bun:sqlite 封装。单例，延迟初始化。
-
-  agent/
-    graph.ts           — LangGraph StateGraph 定义。节点 + 边 + 条件路由。
-    nodes.ts           — 状态节点函数。parseIntent, planSteps, executeTool 等。
-    tools.ts           — 工具注册表。registerTool + LangGraph ToolNode 集成。
-    prompts.ts         — 系统提示词 + 工具描述模板。直接影响 Agent 行为。
-    checkpointer.ts    — SqliteSaver。bun:sqlite 实现的检查点持久化。
-
-  tui/
-    app.ts             — TUI 根应用。ProcessTerminal + TUI 实例管理。
-    screens/           — 全屏界面。chat（默认）, jobs, detail, tools, config。
-    components/        — 可复用组件。messagelist, jobtable, logstream 等。
-    themes/            — pi-TUI 主题定义。颜色、边框、间距。
-
-  executor/
-    subprocess.ts      — 通用子进程执行。Bun.spawn + 流式 stdout/stderr。
-    nextflow.ts        — Nextflow 调用封装。pipeline 参数传递 + 进度解析。
-    gget.ts            — 生物数据确定性检索。Ensembl REST, NCBI E-utilities。
-    monitor.ts         — 系统资源采集。/proc, nvidia-smi 解析。
-
-  tools/               — 确定性工具定义。每个文件一个工具类别。
-    index.ts           — 注册所有工具到全局数组。Agent 启动时读取。
-    aligners.ts        — bwa_mem, star_align, bowtie2_align
-    variant.ts         — gatk_haplotypecaller, gatk_mutect2, bcftools_call
-    qc.ts              — fastqc, multiqc, samtools_flagstat
-    quant.ts           — featurecounts, salmon_quant, kallisto_quant
-    annotation.ts      — ensembl_lookup, ncbi_fetch, uniprot_query
-    pipelines.ts       — nextflow_run_rnaseq, nextflow_run_wgs 等
-
-  types/               — Zod Schema 定义。所有数据结构从这里导出。
-    job.ts, tool.ts, message.ts, config.ts
-
-  utils/               — 纯函数工具。无状态，无副作用。
-    logger.ts, ansi.ts, time.ts, validators.ts
-```
-
----
-
-## 现状(v1)
-
-> 上方「项目地图」是完整愿景。当前 `src/` 只实现了聊天客户端层；Agent、工具、子进程、bun:sqlite 均未引入。以下为代码真相，修改以本节为准。
-
-### 已实现文件
-
-```
-src/
-  main.ts              — 入口。解析 --version，启动 HelixApp。
-  config.ts            — Zod 配置模型 + ~/.helix/config.toml 持久化，
-                         模型缓存（~/.helix/models_cache.toml），从 /v1/models 拉模型列表。
-  catalog.ts           — 从 models.dev/api.json 拉 provider 目录，磁盘缓存。
-  commands/
-    index.ts           — CommandRegistry 单例 + CommandContext + SlashCommandDef。
-    provider.ts        — /provider 斜杠命令（选 provider → 输 API key）。
-    model.ts           — /model 斜杠命令（选模型 + thinking 开关）。
-  llm/
-    types.ts           — 统一 LLM 类型（LLMMessage / LLMEvent / LLMToolCall）。
-    provider.ts        — LLMProvider 接口（只有 stream() 一个方法）。
-    factory.ts         — 按 provider.type 创建适配器。
-    adapters/
-      openai.ts        — OpenAI Chat Completions + reasoning_content。
-      anthropic.ts     — Anthropic Messages。
-      google-genai.ts  — Google GenAI。
-  tui/
-    app.ts             — HelixApp：全局快捷键（Ctrl+L / Ctrl+/ / Ctrl+C）。
-    screens/
-      chat.ts          — ChatScreen：唯一常驻界面。编辑器 + 流式聊天 +
-                         reasoning 展示 + 斜杠命令路由 + 自动补全。
-  utils/
-    icons.ts           — provider 图标。
-```
-
-### 命令
+## 命令与验收
 
 ```bash
-bun --hot src/main.ts                             # 开发热重载
-bun build --compile --outfile helix src/main.ts   # 编译单二进制（~70MB）
-./helix                                           # 运行
-bunx tsc --noEmit                                 # 类型检查
+bun --hot src/main.ts
+bun test
+bun run test:integration
+bunx tsc --noEmit
+bun build --compile --outfile helix src/main.ts
+./helix --version
+./helix --help
 ```
 
-无测试套件、无 linter。
+本阶段完成必须满足：
 
-### 关键模式
+1. 默认测试离线通过；
+2. 真实 SeqKit 2.13.0 对 FASTA、FASTQ、BAM fixture 的集成测试通过；
+3. 类型检查通过；
+4. 单二进制编译及 `--version/--help` 烟测通过；
+5. `git diff --check` 通过；
+6. 工作区没有测试生成的凭证、工具、Session 或 subagent artifact。
 
-**斜杠命令。** 命令通过 `registry.register({name, description, execute})` 注册。`execute` 回调收到 `CommandContext`，可替换编辑器显示内联 UI、加系统消息、触发 provider/model 刷新。自动补全经 pi-TUI 的 `CombinedAutocompleteProvider` 接入。
+## 上游 Pi 升级
 
-**配置流。** `loadConfig()` 读 `~/.helix/config.toml` → Zod 解析 → 类型化 Config。`saveConfig()` 校验后写 TOML。Provider/model 变更即时持久化。环境变量（如 `KIMI_API_KEY`、`KIMI_BASE_URL`、`KIMI_MODEL`）在运行时覆盖配置值。
+- `@earendil-works/pi-coding-agent` 使用精确版本和 lockfile，不允许浮动升级。
+- Pi 相关 import 和组合只存在于 Runtime/资源边界。
+- 升级使用独立 `chore(pi)` 分支或 PR，先阅读 changelog 的 breaking changes。
+- 必须重新运行 SDK 契约测试、认证/模型交互烟测、Session 恢复、Tool 中断和单二进制构建。
+- Helix 版本内嵌一个已验证 Pi 版本，不承诺任意 Helix/Pi 版本组合兼容。
 
-**多协议流式聊天。** `ChatScreen` 通过 `createLLMProvider()` 拿到 `LLMProvider`，调 `stream()` 得 `AsyncIterable<LLMEvent>`。适配器把各家协议映射成统一事件流（`content` / `tool_call` / `status` / `error` / `done`）。中断用 `AbortController`——首次 Ctrl+C 中断流，第二次退出。
+## 工作流
 
-**ANSI 渲染。** pi-TUI 期望字符串内嵌原始 ANSI 转义。颜色常量（`DIM`、`CYAN`、`GREEN`、`RED`、`YELLOW`）在各渲染文件内定义。辅助函数：`truncateToWidth`、`visibleWidth`、`wrapTextWithAnsi`。
-
----
-
-## 工作流要求
-
-**提交规范。** 提交信息遵循 `<type>(<scope>): <subject>`。类型：`feat`, `fix`, `docs`, `refactor`, `test`, `chore`。Scope 是修改的目录或模块。Subject 用英文祈使句（"add" not "added"）。
-
-**阶段门控。** 每个开发阶段在 `HelixCli_vibecoding_prompt.txt` 中有验收标准。完成一个阶段后，运行全部验收检查，全部通过后才能标记阶段完成并进入下一阶段。
-
----
-
-## 分发原则
-
-**构建产物是唯一的交付单元。** 用户拿到的是 `helix` 这一个文件（50-80MB），不是源码，不是 npm 包，不是 Docker 镜像。CI 通过 `bun build --compile` 生成多平台二进制，通过 GitHub Releases 分发。
-
-**install.sh 是唯一的安装入口。** 脚本检测平台、下载对应二进制、放到 `~/.local/bin`、验证。用户不需要选择，不需要配置，不需要阅读文档。一行命令，一个可执行文件。
+提交信息遵循 `<type>(<scope>): <subject>`，subject 使用英文祈使句。除非用户明确要求，不 stage、commit、push、发布或创建 PR。
